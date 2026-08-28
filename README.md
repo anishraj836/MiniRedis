@@ -1,4 +1,4 @@
-# MiniRedis ⚡
+# MiniRedis
 
 [![C++17](https://img.shields.io/badge/Language-C%2B%2B17-blue.svg)](https://en.cppreference.com/w/cpp/17)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-lightgrey.svg)](https://github.com/)
@@ -6,25 +6,25 @@
 [![Test Coverage](https://img.shields.io/badge/Tests-14%2F14%20Passing-success.svg)](https://github.com/)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**MiniRedis** is a high-throughput, multi-threaded in-memory key-value database built from scratch in modern **C++17**. It implements the standard **Redis Serialization Protocol (RESP2)**, features a scalable **multi-reactor network architecture** (`epoll`/`kqueue`), fine-grained **64-shard lock-striped concurrency**, $O(1)$ LRU memory eviction, dual-tier TTL expiration, and **Append-Only File (AOF)** durability with live background compaction (`BGREWRITEAOF`).
+MiniRedis is a high-throughput, multi-threaded in-memory key-value database built from scratch in modern C++17. It implements the Redis Serialization Protocol (RESP2), features a non-blocking multi-reactor network engine (`epoll`/`kqueue`), 64-shard lock-striped concurrency, O(1) LRU eviction, dual-tier TTL expiration, and Append-Only File (AOF) durability with live background compaction (`BGREWRITEAOF`).
 
 ---
 
-## 📑 Table of Contents
+## Table of Contents
 
-- [Key Features](#-key-features)
-- [System Architecture](#-system-architecture)
+- [Key Features](#key-features)
+- [System Architecture](#system-architecture)
   - [1. Multi-Reactor Network Engine](#1-multi-reactor-network-engine)
   - [2. 64-Shard Lock-Striped Storage](#2-64-shard-lock-striped-storage)
   - [3. O(1) LRU Eviction with SpinLock Isolation](#3-o1-lru-eviction-with-spinlock-isolation)
   - [4. Dual-Tier TTL Expiration](#4-dual-tier-ttl-expiration)
   - [5. Append-Only File Durability & Live Compaction](#5-append-only-file-durability--live-compaction)
-- [Design Trade-offs: MiniRedis vs. Real Redis](#-design-trade-offs-miniredis-vs-real-redis)
-- [Supported Commands](#-supported-commands)
-- [Performance & Benchmarks](#-performance--benchmarks)
-- [Edge-Case Hardening & Resiliency](#-edge-case-hardening--resiliency)
-- [Project Directory Layout](#-project-directory-layout)
-- [Getting Started](#-getting-started)
+- [Design Trade-offs: MiniRedis vs. Real Redis](#design-trade-offs-miniredis-vs-real-redis)
+- [Supported Commands](#supported-commands)
+- [Performance & Benchmarks](#performance--benchmarks)
+- [Edge-Case Hardening & Resiliency](#edge-case-hardening--resiliency)
+- [Project Directory Layout](#project-directory-layout)
+- [Getting Started](#getting-started)
   - [Prerequisites](#prerequisites)
   - [Building from Source](#building-from-source)
   - [Running the Test Battery](#running-the-test-battery)
@@ -32,23 +32,23 @@
   - [Using the CLI Client](#using-the-cli-client)
   - [Running the Benchmark Tool](#running-the-benchmark-tool)
   - [Running via Docker](#running-via-docker)
-- [License](#-license)
+- [License](#license)
 
 ---
 
-## 🌟 Key Features
+## Key Features
 
-* **⚡ Native RESP2 Protocol:** Zero-copy streaming parser with transactional rollback support for fragmented TCP chunks, bulk binary payloads, and inline command tokens.
-* **🌐 Asynchronous Multi-Reactor:** Master-worker event loop design using OS multiplexers (`kqueue` on macOS/BSD, `epoll` on Linux, fallback `poll`) with level-triggered write quenching and `readv` stack vector buffers.
-* **🔒 Lock-Striped Concurrency:** Keys are partitioned across 64 discrete shards via MurmurHash3. Reads use `std::shared_lock<std::shared_mutex>` while writes lock only the target shard, enabling multi-core scalability without global lock contention.
-* **🧠 $O(1)$ LRU Memory Management:** In-memory doubly-linked list with hash map iterators. Read promotions are protected by hardware-paused spinlocks (`_mm_pause` / ARM `yield`) to eliminate reader-writer lock escalation bottlenecks.
-* **⏱️ Dual-Tier TTL Expiration:** Combines lazy/passive expiration (purging expired keys upon access) with an active periodic randomized sampling sweep ($20$ keys/shard every $100\text{ms}$).
-* **💾 AOF Persistence & Live Compaction:** Double-buffered asynchronous disk flushing thread with configurable policies (`always`, `everysec`, `no`), crash-recovery replayer, and online background compaction (`BGREWRITEAOF`) with live mutation delta buffering.
-* **🛡️ Hardened & Sanitized:** 14 automated test suites (including 6 stress and edge-case suites) clean under AddressSanitizer (`-fsanitize=address,undefined`) and ThreadSanitizer (`-fsanitize=thread`).
+* **Native RESP2 Protocol:** Zero-copy streaming parser with transactional rollback support for fragmented TCP chunks, bulk binary payloads, and inline command tokens.
+* **Asynchronous Multi-Reactor:** Master-worker event loop design using OS multiplexers (`kqueue` on macOS/BSD, `epoll` on Linux, fallback `poll`) with level-triggered write quenching and `readv` stack vector buffers.
+* **Lock-Striped Concurrency:** Keys are partitioned across 64 discrete shards via MurmurHash3. Reads use `std::shared_lock<std::shared_mutex>` while writes lock only the target shard, enabling multi-core scalability without global lock contention.
+* **O(1) LRU Memory Management:** In-memory doubly-linked list with hash map iterators. Read promotions are protected by hardware-paused spinlocks (`_mm_pause` / ARM `yield`) to eliminate reader-writer lock escalation bottlenecks.
+* **Dual-Tier TTL Expiration:** Combines lazy/passive expiration (purging expired keys upon access) with an active periodic randomized sampling sweep (20 keys/shard every 100ms).
+* **AOF Persistence & Live Compaction:** Double-buffered asynchronous disk flushing thread with configurable policies (`always`, `everysec`, `no`), crash-recovery replayer, and online background compaction (`BGREWRITEAOF`) with live mutation delta buffering.
+* **Hardened & Sanitized:** 14 automated test suites (including 6 stress and edge-case suites) clean under AddressSanitizer (`-fsanitize=address,undefined`) and ThreadSanitizer (`-fsanitize=thread`).
 
 ---
 
-## 🏛️ System Architecture
+## System Architecture
 
 ```
                                   +-----------------------+
@@ -128,11 +128,11 @@ Rather than using a single global mutex (which bottlenecked multi-core throughpu
 
 ---
 
-### 3. $O(1)$ LRU Eviction with SpinLock Isolation
+### 3. O(1) LRU Eviction with SpinLock Isolation
 
 Each shard maintains an independent **Least Recently Used (LRU)** cache using a doubly-linked list (`std::list<std::string>`) combined with an iterator lookup map (`std::unordered_map<std::string, list::iterator>`):
 * **The Promotion Problem:** In standard read-write locks, a read operation (`GET`) needs to move the accessed key to the head of the LRU list. Upgrading a `shared_lock` to a `unique_lock` causes reader starvation and deadlocks.
-* **The Solution (SpinLock Isolation):** Data retrieval occurs under `std::shared_lock`, but LRU node promotion (`std::list::splice`) is guarded by a microsecond-duration `SpinLock` using hardware-pause instructions (`_mm_pause` on x86, `__yield()` on ARM). This keeps read operations concurrent while ensuring $O(1)$ LRU tracking with zero memory allocations.
+* **The Solution (SpinLock Isolation):** Data retrieval occurs under `std::shared_lock`, but LRU node promotion (`std::list::splice`) is guarded by a microsecond-duration `SpinLock` using hardware-pause instructions (`_mm_pause` on x86, `__yield()` on ARM). This keeps read operations concurrent while ensuring O(1) LRU tracking with zero memory allocations.
 
 ---
 
@@ -140,7 +140,7 @@ Each shard maintains an independent **Least Recently Used (LRU)** cache using a 
 
 Keys can be assigned precision millisecond time-to-live timestamps:
 1. **Passive / Lazy Expiration:** Whenever any key is read or updated, its expiration timestamp is checked against `now_ms()`. If expired, the key is purged on-demand and `nil` is returned.
-2. **Active Periodic Sweeper:** Every $100\text{ms}$, an active sweep samples $20$ random keys per shard. If more than $25\%$ of the sampled keys are expired, the cycle repeats immediately until expired keys fall below the threshold, preventing memory leaks on inactive keys.
+2. **Active Periodic Sweeper:** Every 100ms, an active sweep samples 20 random keys per shard. If more than 25% of the sampled keys are expired, the cycle repeats immediately until expired keys fall below the threshold, preventing memory leaks on inactive keys.
 
 ---
 
@@ -156,42 +156,42 @@ MiniRedis guarantees persistence via an **Append-Only File (AOF)**:
 
 ---
 
-## ⚖️ Design Trade-offs: MiniRedis vs. Real Redis
+## Design Trade-offs: MiniRedis vs. Real Redis
 
 | Dimension | MiniRedis Architecture | Official Redis Architecture | Rationale & Trade-off |
 | :--- | :--- | :--- | :--- |
 | **Concurrency Model** | Multi-threaded multi-reactor + 64-shard lock striping | Single-threaded event loop (Redis 6.0+ uses I/O threads for networking only) | MiniRedis scales computation and memory lookups natively across multi-core CPUs; Redis avoids all locking overhead by keeping storage strictly single-threaded. |
 | **Snapshot Durability** | Multi-threaded snapshot iteration + live mutation delta buffer | Linux kernel `fork()` using hardware Copy-on-Write (CoW) | MiniRedis remains cross-platform portable without relying on OS `fork()` semantics; Redis achieves zero-latency lock-free snapshots via kernel page tables. |
-| **Memory Tracking** | Analytical structural estimation ($\sim 95\%$ accuracy) | Allocator hooks into `jemalloc`/`zmalloc` | MiniRedis calculates memory based on `sizeof(T)` + container capacities; official Redis tracks exact physical heap page allocations via custom allocators. |
+| **Memory Tracking** | Analytical structural estimation (~95% accuracy) | Allocator hooks into `jemalloc`/`zmalloc` | MiniRedis calculates memory based on `sizeof(T)` + container capacities; official Redis tracks exact physical heap page allocations via custom allocators. |
 | **Multi-Key Operations** | Sorted shard lock acquisition (`std::set<size_t>`) | Global single-threaded access | MiniRedis provides deadlock-free multi-key transactions across shards at the cost of acquiring multiple mutexes; Redis executes multi-key commands with zero lock overhead. |
 
 ---
 
-## 💻 Supported Commands
+## Supported Commands
 
 MiniRedis implements **35 core Redis commands** with full RESP2 compliance:
 
-### 🔤 Strings
+### Strings
 `SET`, `GET`, `MSET`, `MGET`, `DEL`, `EXISTS`, `TYPE`, `STRLEN`, `APPEND`, `INCR`, `DECR`, `INCRBY`, `DECRBY`
 
-### 🗂️ Hashes
+### Hashes
 `HSET`, `HGET`, `HDEL`, `HEXISTS`, `HLEN`, `HKEYS`, `HVALS`, `HGETALL`, `HMSET`, `HMGET`
 
-### 📋 Lists
+### Lists
 `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`
 
-### 🎯 Sets
+### Sets
 `SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`, `SCARD`
 
-### ⏱️ Key Expiry & Persistence
+### Key Expiry & Persistence
 `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`
 
-### ⚙️ Server & Telemetry
+### Server & Telemetry
 `PING`, `ECHO`, `INFO`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `BGREWRITEAOF`, `SHUTDOWN`
 
 ---
 
-## 📊 Performance & Benchmarks
+## Performance & Benchmarks
 
 Benchmarked using `./bin/miniredis-bench` on Apple Silicon (M-series, 8 cores, 16GB RAM):
 
@@ -203,19 +203,19 @@ Target: 127.0.0.1:16379 | Concurrency: 50 Clients | Shards: 64
 Payload Size: 32 bytes  | Pipeline Depth: 16
 ```
 
-### 🚀 Throughput (Requests Per Second)
-* **Single-Command Throughput:** $\approx 42,500\text{ QPS}$
-* **Pipelined Throughput (Depth = 16):** $\approx 265,000\text{ QPS}$
+### Throughput (Requests Per Second)
+* **Single-Command Throughput:** ~42,500 QPS
+* **Pipelined Throughput (Depth = 16):** ~265,000 QPS
 
-### ⏱️ Latency Distribution (Single Stream)
-* **$P_{50}$ (Median):** $0.18\text{ ms}$
-* **$P_{95}$:** $0.42\text{ ms}$
-* **$P_{99}$:** $0.79\text{ ms}$
-* **Max Latency:** $2.14\text{ ms}$
+### Latency Distribution (Single Stream)
+* **P50 (Median):** 0.18 ms
+* **P95:** 0.42 ms
+* **P99:** 0.79 ms
+* **Max Latency:** 2.14 ms
 
 ---
 
-## 🛡️ Edge-Case Hardening & Resiliency
+## Edge-Case Hardening & Resiliency
 
 MiniRedis includes **6 dedicated edge-case test suites** verifying real-world failure modes:
 
@@ -230,7 +230,7 @@ MiniRedis includes **6 dedicated edge-case test suites** verifying real-world fa
 
 ---
 
-## 📂 Project Directory Layout
+## Project Directory Layout
 
 ```
 mini redis/
@@ -283,12 +283,12 @@ mini redis/
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
 * **Compiler:** `clang++` or `g++` supporting **C++17** or higher.
-* **Build System:** `make` (or `cmake` $\ge 3.16$).
-* **Operating System:** macOS ($10.14+$) or Linux ($Kernel \ge 3.10$).
+* **Build System:** `make` (or `cmake` >= 3.16).
+* **Operating System:** macOS (10.14+) or Linux (Kernel >= 3.10).
 
 ### Building from Source
 ```bash
@@ -410,6 +410,6 @@ docker exec -it miniredis ./bin/miniredis-cli
 
 ---
 
-## 📄 License
+## License
 
 This project is open-source and licensed under the **MIT License**. See `LICENSE` for details.
