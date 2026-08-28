@@ -1,0 +1,17 @@
+# Build outputs & binaries
+bin/
+*.o
+*.a
+*.so
+*.dylib
+
+# Persistence & temporary files
+*.aof
+*.temp
+miniredis.aof
+
+# OS & IDE metadata
+.DS_Store
+.vscode/
+.idea/
+*.swp
