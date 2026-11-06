@@ -95,7 +95,10 @@ void TcpServer::handle_accept() {
         conn->set_message_callback(message_cb_);
         conn->set_write_complete_callback(write_complete_cb_);
         conn->set_close_callback([this](const ConnectionPtr& c) {
-            remove_connection(c);
+            if (close_cb_) {
+                close_cb_(c);
+            }
+            remove_connection(c);  // drops the last owning reference -> socket is closed
         });
 
         if (conn_cb_) {

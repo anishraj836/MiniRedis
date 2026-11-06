@@ -3,11 +3,16 @@
 #include <iostream>
 #include <csignal>
 #include <cstdlib>
+#include <unistd.h>
 
 static miniredis::RedisServer* g_server = nullptr;
 
-void signal_handler(int sig) {
-    std::cout << "\nCaught signal " << sig << ", initiating clean shutdown...\n";
+// Only async-signal-safe calls are allowed here: std::cout (used before) can
+// deadlock if the signal interrupts another write to the same stream.
+void signal_handler(int) {
+    static const char msg[] = "\nCaught signal, initiating clean shutdown...\n";
+    ssize_t n = ::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    (void)n;
     if (g_server) {
         g_server->stop();
     }

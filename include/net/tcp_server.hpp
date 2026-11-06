@@ -24,6 +24,10 @@ public:
     void set_connection_callback(NewConnectionCallback cb) { conn_cb_ = std::move(cb); }
     void set_message_callback(MessageCallback cb) { message_cb_ = std::move(cb); }
     void set_write_complete_callback(WriteCompleteCallback cb) { write_complete_cb_ = std::move(cb); }
+    // Invoked when a connection closes, before the server releases it.
+    // Use this instead of Connection::set_close_callback: the server installs
+    // its own close hook on every connection to free the socket.
+    void set_close_callback(CloseCallback cb) { close_cb_ = std::move(cb); }
 
     bool start();
     void stop();
@@ -48,6 +52,7 @@ private:
     NewConnectionCallback conn_cb_;
     MessageCallback message_cb_;
     WriteCompleteCallback write_complete_cb_;
+    CloseCallback close_cb_;
 };
 
 } // namespace miniredis

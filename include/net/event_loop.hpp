@@ -38,7 +38,7 @@ public:
     bool remove_channel(int fd);
 
     [[nodiscard]] bool is_in_loop_thread() const noexcept {
-        return thread_id_ == std::this_thread::get_id();
+        return thread_id_.load(std::memory_order_acquire) == std::this_thread::get_id();
     }
 
     void assert_in_loop_thread() const;
@@ -58,7 +58,9 @@ private:
 
     std::atomic<bool> looping_{false};
     std::atomic<bool> quit_{false};
-    std::thread::id thread_id_;
+    // Written by the loop thread when loop() starts, read by any thread that
+    // posts work to this loop: must be atomic.
+    std::atomic<std::thread::id> thread_id_{};
 
     std::unique_ptr<Poller> poller_;
     int wakeup_pipe_[2]{-1, -1};

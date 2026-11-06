@@ -66,7 +66,11 @@ void Connection::handle_read() {
     ssize_t n = input_buffer_.read_fd(socket_.fd(), &saved_errno);
 
     if (n > 0) {
-        if (message_cb_) {
+        if (state_ != ConnectionState::CONNECTED) {
+            // Shutting down (after QUIT or a protocol error): replies can no
+            // longer be sent, so input must not be executed either.
+            input_buffer_.retrieve_all();
+        } else if (message_cb_) {
             message_cb_(shared_from_this(), input_buffer_);
         }
     } else if (n == 0) {
