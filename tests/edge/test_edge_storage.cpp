@@ -17,17 +17,18 @@ void test_type_collision() {
 
     auto& shard = engine.get_shard("coll_key");
 
-    // Attempt HSET on a STRING -> must fail with -1 (WRONGTYPE)
-    int hres = shard.hset("coll_key", {{"f1", "v1"}});
-    assert(hres < 0);
+    // Attempt HSET on a STRING -> must fail with WRONGTYPE
+    int64_t hres = shard.hset("coll_key", {{"f1", "v1"}});
+    assert(hres == StorageShard::WRONG_TYPE);
 
-    // Attempt LPUSH on a STRING -> returns 0, string unmodified
-    size_t lres = shard.lpush("coll_key", {"item1"});
-    assert(lres == 0);
+    // Attempt LPUSH on a STRING -> WRONGTYPE (it used to return 0, which the
+    // client saw as "(integer) 0" instead of an error), string unmodified
+    int64_t lres = shard.lpush("coll_key", {"item1"});
+    assert(lres == StorageShard::WRONG_TYPE);
 
-    // Attempt SADD on a STRING -> returns 0, string unmodified
-    size_t sres = shard.sadd("coll_key", {"item1"});
-    assert(sres == 0);
+    // Attempt SADD on a STRING -> WRONGTYPE, string unmodified
+    int64_t sres = shard.sadd("coll_key", {"item1"});
+    assert(sres == StorageShard::WRONG_TYPE);
 
     // Verify string was not corrupted
     assert(engine.get_string("coll_key").value_or("") == "string_val");
