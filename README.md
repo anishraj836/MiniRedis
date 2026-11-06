@@ -198,25 +198,16 @@ Operations against a key holding the wrong type return `WRONGTYPE`, as in Redis.
 
 ## Performance & Benchmarks
 
-Benchmarked using `./bin/miniredis-bench` on Apple Silicon (M-series, 8 cores, 16GB RAM):
+Measured with `./bin/miniredis-bench -c 50 -n 200000 -t 4` on an Apple M2 laptop (8 cores, 8 GB RAM), client and server on the same machine, single runs:
 
-```
-==================================================================
-              MiniRedis High-Performance Benchmark Suite           
-==================================================================
-Target: 127.0.0.1:16379 | Concurrency: 50 Clients | Shards: 64
-Payload Size: 32 bytes  | Pipeline Depth: 16
-```
+| Mode | SET | GET | INCR |
+| :--- | :--- | :--- | :--- |
+| No pipelining, AOF off | ~116k req/s | ~120k req/s | ~113k req/s |
+| Pipeline depth 16, AOF off | ~378k req/s | ~378k req/s | ~405k req/s |
 
-### Throughput (Requests Per Second)
-* **Single-Command Throughput:** ~42,500 QPS
-* **Pipelined Throughput (Depth = 16):** ~265,000 QPS
+Without pipelining, SET reported p50 0.03 ms and p99 0.07 ms.
 
-### Latency Distribution (Single Stream)
-* **P50 (Median):** 0.18 ms
-* **P95:** 0.42 ms
-* **P99:** 0.79 ms
-* **Max Latency:** 2.14 ms
+These are rough, single-machine numbers: the bench keeps at most one request (or batch) in flight per thread, reports pipelined latency as batch time divided by batch size, and has not been run against real Redis for comparison. See [ARCHITECTURE.md §9](ARCHITECTURE.md#9-benchmarks-and-how-to-read-them) for details and the exact commands. Design notes and known limitations are in [ARCHITECTURE.md](ARCHITECTURE.md); interview prep notes are in [PARANOID_GUIDE.md](PARANOID_GUIDE.md).
 
 ---
 
