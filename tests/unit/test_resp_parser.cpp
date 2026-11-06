@@ -91,6 +91,47 @@ void test_inline_command() {
     std::cout << "[PASS] test_inline_command\n";
 }
 
+void test_inline_single_quotes() {
+    ByteBuffer buf;
+    buf.append("SET a 'hello haha'\r\n");
+
+    RespParser parser;
+    std::vector<std::string> cmd;
+    ParseResult res = parser.parse_command(buf, cmd);
+
+    assert(res == ParseResult::OK);
+    assert(cmd.size() == 3);
+    assert(cmd[2] == "hello haha");
+    assert(buf.empty());
+    std::cout << "[PASS] test_inline_single_quotes\n";
+}
+
+void test_inline_unbalanced_quotes() {
+    ByteBuffer buf;
+    buf.append("SET a 'hello\r\n");
+
+    RespParser parser;
+    std::vector<std::string> cmd;
+    ParseResult res = parser.parse_command(buf, cmd);
+
+    assert(res == ParseResult::ERROR);
+    assert(cmd.empty());
+    assert(buf.empty());
+    std::cout << "[PASS] test_inline_unbalanced_quotes\n";
+}
+
+void test_inline_closing_quote_followed_by_text() {
+    ByteBuffer buf;
+    buf.append("SET a \"hi\"there\r\n");
+
+    RespParser parser;
+    std::vector<std::string> cmd;
+    ParseResult res = parser.parse_command(buf, cmd);
+
+    assert(res == ParseResult::ERROR);
+    std::cout << "[PASS] test_inline_closing_quote_followed_by_text\n";
+}
+
 int main() {
     std::cout << "Running RESP Parser Unit Tests...\n";
     test_simple_string();
@@ -98,6 +139,9 @@ int main() {
     test_bulk_string();
     test_array_and_command();
     test_inline_command();
+    test_inline_single_quotes();
+    test_inline_unbalanced_quotes();
+    test_inline_closing_quote_followed_by_text();
     std::cout << "All RESP Parser Unit Tests Passed!\n";
     return 0;
 }

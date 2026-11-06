@@ -1,4 +1,5 @@
 #include "protocol/resp_parser.hpp"
+#include "common/tokenizer.hpp"
 #include <charconv>
 #include <sstream>
 
@@ -170,31 +171,14 @@ ParseResult RespParser::parse_inline_command(ByteBuffer& buffer, std::vector<std
     }
 
     std::string_view line(buffer.peek(), line_len);
+    std::string error;
+    bool ok = tokenize_command_line(line, out_cmd, error);
     buffer.retrieve((eol + 1) - buffer.peek());
 
-    out_cmd.clear();
-    std::string token;
-    bool in_quotes = false;
-
-    for (size_t i = 0; i < line.size(); ++i) {
-        char c = line[i];
-        if (c == '\\' && in_quotes && i + 1 < line.size() && (line[i+1] == '"' || line[i+1] == '\\')) {
-            token += line[++i];
-        } else if (c == '"') {
-            in_quotes = !in_quotes;
-        } else if ((c == ' ' || c == '\t') && !in_quotes) {
-            if (!token.empty()) {
-                out_cmd.push_back(token);
-                token.clear();
-            }
-        } else {
-            token += c;
-        }
+    if (!ok) {
+        out_cmd.clear();
+        return ParseResult::ERROR;
     }
-    if (!token.empty()) {
-        out_cmd.push_back(token);
-    }
-
     return out_cmd.empty() ? ParseResult::INCOMPLETE : ParseResult::OK;
 }
 

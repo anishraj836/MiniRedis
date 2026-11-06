@@ -26,7 +26,8 @@ RespValue handle_set(const Command& cmd, StorageEngine& engine, RedisServer*) {
     bool xx = false;
     int64_t expire_at_ms = -1;
 
-    for (size_t i = 2; i < cmd.tokens().size(); ++i) {
+    // Options start after key and value (index 2 is the value, not an option)
+    for (size_t i = 3; i < cmd.tokens().size(); ++i) {
         std::string opt = cmd.tokens()[i];
         std::transform(opt.begin(), opt.end(), opt.begin(), [](unsigned char c) { return std::toupper(c); });
 
@@ -46,6 +47,9 @@ RespValue handle_set(const Command& cmd, StorageEngine& engine, RedisServer*) {
             if (ec != std::errc() || ms <= 0) return RespValue::make_error("ERR invalid expire time in set");
             expire_at_ms = now_ms() + ms;
             ++i;
+        } else {
+            // Unknown option, or EX/PX without a value
+            return RespValue::make_error("ERR syntax error");
         }
     }
 
