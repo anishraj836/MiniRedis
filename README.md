@@ -42,9 +42,10 @@ MiniRedis is a high-throughput, multi-threaded in-memory key-value database buil
 * **Asynchronous Multi-Reactor:** Master-worker event loop design using OS multiplexers (`kqueue` on macOS/BSD, `epoll` on Linux, fallback `poll`) with level-triggered write quenching and `readv` stack vector buffers.
 * **Lock-Striped Concurrency:** Keys are partitioned across 64 discrete shards via MurmurHash3. Reads use `std::shared_lock<std::shared_mutex>` while writes lock only the target shard, enabling multi-core scalability without global lock contention.
 * **O(1) LRU Memory Management:** In-memory doubly-linked list with hash map iterators. Read promotions are protected by hardware-paused spinlocks (`_mm_pause` / ARM `yield`) to eliminate reader-writer lock escalation bottlenecks.
-* **Dual-Tier TTL Expiration:** Combines lazy/passive expiration (purging expired keys upon access) with an active periodic randomized sampling sweep (20 keys/shard every 100ms).
-* **AOF Persistence & Live Compaction:** Double-buffered asynchronous disk flushing thread with configurable policies (`always`, `everysec`, `no`), crash-recovery replayer, and online background compaction (`BGREWRITEAOF`) with live mutation delta buffering.
-* **Hardened & Sanitized:** 14 automated test suites (including 6 stress and edge-case suites) clean under AddressSanitizer (`-fsanitize=address,undefined`) and ThreadSanitizer (`-fsanitize=thread`).
+* **Dual-Tier TTL Expiration:** Combines lazy/passive expiration (purging expired keys upon access) with an active sweeper that pops due keys from each shard's min-heap every 100ms under a 2ms time budget.
+* **AOF Persistence & Live Compaction:** Asynchronous disk flushing thread with configurable policies (`always`, `everysec`, `no`), crash-recovery replayer that repairs torn tails, and online background compaction (`BGREWRITEAOF`) with an exact snapshot/delta split.
+* **Atomic Writes:** Striped per-key write locks make read-modify-write commands (`INCR`, `SETNX`, `APPEND`, `HINCRBY`, `SET NX`) atomic and keep the AOF in the order writes were applied.
+* **Hardened & Sanitized:** 15 automated test suites (including 6 edge-case suites and a 26-case bug regression suite) clean under AddressSanitizer + UBSan (`make asan`) and ThreadSanitizer (`make tsan`).
 
 ---
 
@@ -140,19 +141,21 @@ Each shard maintains an independent **Least Recently Used (LRU)** cache using a 
 
 Keys can be assigned precision millisecond time-to-live timestamps:
 1. **Passive / Lazy Expiration:** Whenever any key is read or updated, its expiration timestamp is checked against `now_ms()`. If expired, the key is purged on-demand and `nil` is returned.
-2. **Active Periodic Sweeper:** Every 100ms, an active sweep samples 20 random keys per shard. If more than 25% of the sampled keys are expired, the cycle repeats immediately until expired keys fall below the threshold, preventing memory leaks on inactive keys.
+2. **Active Periodic Sweeper:** Every 100ms the sweeper pops keys whose deadline has passed from each shard's TTL min-heap, soonest first, in batches of 20. It stops when a 2ms time budget is used up and resumes at the next shard in the following cycle, so no expired key is skipped and a burst of expirations cannot stall the event loop. Stale heap entries (from refreshed or removed TTLs) are dropped lazily, and the heap is compacted when they dominate.
 
 ---
 
 ### 5. Append-Only File Durability & Live Compaction
 
 MiniRedis guarantees persistence via an **Append-Only File (AOF)**:
-* **Double-Buffered Async Logger:** Incoming mutations serialize into RESP format and append to a thread-safe `primary_buffer_`. A dedicated background flusher thread periodically swaps `primary_buffer_` with `secondary_buffer_` and writes to disk, issuing `fcntl(fd, F_FULLFSYNC)` (macOS) or `fdatasync()` (Linux).
+* **Ordered Writes:** Every write command holds the striped write locks of its keys while it executes *and* while it is appended, so the log order always matches the order writes were applied. Commands that fail are not logged.
+* **Replay-Safe Commands:** Relative expiries are rewritten to absolute deadlines before execution (`EXPIRE k 10` becomes `PEXPIREAT k <unix-ms>`, `SET k v EX 10` becomes `SET k v PXAT <unix-ms>`), so expired keys stay expired after a restart.
+* **Async Logger:** Mutations serialize into RESP and append to an in-memory buffer. A background thread writes it out once per second (fsyncing under `everysec`); under `always` the caller writes and fsyncs before replying. File writes are serialized by one mutex and retried on short writes. Durability uses `fcntl(fd, F_FULLFSYNC)` (macOS) or `fdatasync()` (Linux).
 * **Online Background Compaction (`BGREWRITEAOF`):**
-  1. A background thread iterates across all 64 shards under shared read locks to capture a point-in-time state snapshot into a temporary file.
-  2. Simultaneously, the main server engages a `delta_buffer_` to capture all mutating writes occurring during the rewrite.
-  3. Once the snapshot finishes, the accumulated delta is written to the temporary file.
-  4. The temporary file is atomically renamed (`::rename`) over the active AOF file, and the logger reopens its file descriptor to ensure zero lost mutations.
+  1. The rewriter briefly takes all write locks, starts the delta buffer, and serializes a point-in-time snapshot into memory. In-flight writes finish first, so every command lands in exactly one of {snapshot, delta}. Reads continue throughout.
+  2. Locks are released and the snapshot is written to `<aof>.temp` while new writes are logged both to the live AOF and to the delta.
+  3. Most of the delta is drained into the temp file while writers keep running; then, with appends paused for only the final step, the tail is written, fsynced, and the temp file is atomically renamed over the AOF (the directory is fsynced too) and the logger switches to it.
+* **Crash Recovery:** On startup the AOF is replayed. A command torn by a crash at the end of the file is truncated away (so new appends do not land behind garbage); corruption in the middle of the file stops startup instead of silently loading a partial dataset.
 
 ---
 
@@ -161,7 +164,7 @@ MiniRedis guarantees persistence via an **Append-Only File (AOF)**:
 | Dimension | MiniRedis Architecture | Official Redis Architecture | Rationale & Trade-off |
 | :--- | :--- | :--- | :--- |
 | **Concurrency Model** | Multi-threaded multi-reactor + 64-shard lock striping | Single-threaded event loop (Redis 6.0+ uses I/O threads for networking only) | MiniRedis scales computation and memory lookups natively across multi-core CPUs; Redis avoids all locking overhead by keeping storage strictly single-threaded. |
-| **Snapshot Durability** | Multi-threaded snapshot iteration + live mutation delta buffer | Linux kernel `fork()` using hardware Copy-on-Write (CoW) | MiniRedis remains cross-platform portable without relying on OS `fork()` semantics; Redis achieves zero-latency lock-free snapshots via kernel page tables. |
+| **Snapshot Durability** | In-memory snapshot under a brief all-writers pause + live mutation delta buffer | Linux kernel `fork()` using hardware Copy-on-Write (CoW) | MiniRedis remains cross-platform portable without relying on OS `fork()` semantics, at the cost of pausing writes (not reads) while the dataset is serialized; Redis achieves near-zero-pause snapshots via kernel page tables. |
 | **Memory Tracking** | Analytical structural estimation (~95% accuracy) | Allocator hooks into `jemalloc`/`zmalloc` | MiniRedis calculates memory based on `sizeof(T)` + container capacities; official Redis tracks exact physical heap page allocations via custom allocators. |
 | **Multi-Key Operations** | Sorted shard lock acquisition (`std::set<size_t>`) | Global single-threaded access | MiniRedis provides deadlock-free multi-key transactions across shards at the cost of acquiring multiple mutexes; Redis executes multi-key commands with zero lock overhead. |
 
@@ -169,25 +172,27 @@ MiniRedis guarantees persistence via an **Append-Only File (AOF)**:
 
 ## Supported Commands
 
-MiniRedis implements **35 core Redis commands** with full RESP2 compliance:
+MiniRedis implements **60 Redis commands** over RESP2:
 
 ### Strings
-`SET`, `GET`, `MSET`, `MGET`, `DEL`, `EXISTS`, `TYPE`, `STRLEN`, `APPEND`, `INCR`, `DECR`, `INCRBY`, `DECRBY`
+`SET` (with `NX`, `XX`, `GET`, `EX`, `PX`, `EXAT`, `PXAT`, `KEEPTTL`), `GET`, `SETEX`, `SETNX`, `MSET`, `MGET`, `DEL`, `EXISTS`, `TYPE`, `STRLEN`, `APPEND`, `INCR`, `DECR`, `INCRBY`, `DECRBY`
 
 ### Hashes
-`HSET`, `HGET`, `HDEL`, `HEXISTS`, `HLEN`, `HKEYS`, `HVALS`, `HGETALL`, `HMSET`, `HMGET`
+`HSET`, `HGET`, `HDEL`, `HEXISTS`, `HLEN`, `HKEYS`, `HVALS`, `HGETALL`, `HMSET`, `HMGET`, `HINCRBY`
 
 ### Lists
 `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`
 
 ### Sets
-`SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`, `SCARD`
+`SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`, `SCARD`, `SUNION`, `SINTER`, `SDIFF`
 
 ### Key Expiry & Persistence
 `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`
 
 ### Server & Telemetry
-`PING`, `ECHO`, `INFO`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `BGREWRITEAOF`, `SHUTDOWN`
+`PING`, `ECHO`, `INFO`, `TIME`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `CONFIG GET|SET` (`maxmemory`, `maxmemory-policy`), `SHUTDOWN`, `QUIT`
+
+Operations against a key holding the wrong type return `WRONGTYPE`, as in Redis.
 
 ---
 
@@ -217,7 +222,7 @@ Payload Size: 32 bytes  | Pipeline Depth: 16
 
 ## Edge-Case Hardening & Resiliency
 
-MiniRedis includes **6 dedicated edge-case test suites** verifying real-world failure modes:
+MiniRedis includes **6 dedicated edge-case test suites** plus a **bug regression suite** verifying real-world failure modes:
 
 | Test Suite | Edge Case Simulated | Protection Mechanism |
 | :--- | :--- | :--- |
@@ -227,6 +232,7 @@ MiniRedis includes **6 dedicated edge-case test suites** verifying real-world fa
 | **`test_edge_ttl`** | Zero/negative TTL expiration, rescheduling, `PERSIST` lifecycle | Immediate active eviction on negative values, min-heap index synchronization. |
 | **`test_edge_aof`** | Crash recovery on truncated AOF file, concurrent `BGREWRITEAOF` load | Corrupted trailing frame truncation, live delta buffer ingestion, atomic rename. |
 | **`test_edge_network`** | 500-command batch pipeline, sudden disconnects & 100 RST socket floods | Level-triggered write draining, `SIGPIPE` ignoring, graceful connection teardown. |
+| **`test_regressions`** | 26 reproduced bugs: malicious frames, fd leaks, lost `INCR` updates, `SETNX` races, `BGREWRITEAOF` under load, expiry resurrection after restart, torn AOF tails, memory-accounting drift | Bounded parser, striped write locks, exact snapshot/delta split, absolute-deadline logging, AOF tail repair, incremental O(1) memory accounting. |
 
 ---
 
@@ -275,10 +281,10 @@ mini redis/
 │   └── client/                 # Client library & benchmark
 │       └── redis_client.hpp    # Synchronous C++ Redis client
 ├── src/                        # Implementation files (matching include layout)
-└── tests/                      # 14 Test Suites
+└── tests/                      # 15 Test Suites
     ├── unit/                   # 6 Unit test suites (ByteBuffer, RESP, Storage, LRU, TTL, AOF)
     ├── integration/            # 2 Integration test suites (Live TCP commands, Concurrent load)
-    └── edge/                   # 6 Dedicated edge-case test suites
+    └── edge/                   # 6 Edge-case suites + bug regression suite
 ```
 
 ---
@@ -293,8 +299,8 @@ mini redis/
 ### Building from Source
 ```bash
 # Clone the repository
-git clone https://github.com/your-username/mini-redis.git
-cd mini-redis
+git clone https://github.com/anishraj836/MiniRedis.git
+cd MiniRedis
 
 # Clean build all binaries in release mode (-O3)
 make clean
@@ -308,17 +314,17 @@ This compiles three executables into `./bin/`:
 
 ### Running the Test Battery
 ```bash
-# Run all 14 unit, integration, and edge test suites
+# Run all 15 unit, integration, edge and regression test suites
 make test
 
-# Build with AddressSanitizer & UndefinedBehaviorSanitizer
+# Rebuild everything with AddressSanitizer + UndefinedBehaviorSanitizer and run all suites
 make asan
-./bin/test_edge_storage
-./bin/test_edge_network
 
-# Build with ThreadSanitizer (detects data races)
+# Rebuild everything with ThreadSanitizer (detects data races) and run all suites
 make tsan
-./bin/test_concurrent_load
+
+# Sanitizer builds overwrite the regular objects: clean before a normal build
+make clean && make -j4 all
 ```
 
 ---
@@ -336,7 +342,7 @@ make tsan
   --maxmemory 512 \
   --policy allkeys-lru \
   --aof yes \
-  --fsync everysec
+  --aof-policy everysec
 ```
 
 #### Server CLI Flags:
@@ -345,9 +351,10 @@ make tsan
 * `-t, --threads <num>`: Number of worker reactor threads (default: `4`).
 * `-s, --shards <num>`: Number of storage partitions (default: `64`).
 * `-m, --maxmemory <mb>`: Max memory in MB before eviction triggers (default: `256`).
-* `--policy <policy>`: Eviction policy: `noeviction`, `allkeys-lru`, `volatile-lru`.
+* `--policy <policy>`: Eviction policy: `noeviction`, `allkeys-lru`, `volatile-lru`, `allkeys-random`, `volatile-ttl`.
 * `--aof <yes|no>`: Enable Append-Only File durability (default: `yes`).
-* `--fsync <always|everysec|no>`: Disk sync frequency (default: `everysec`).
+* `--aof-policy <always|everysec|no>`: Disk sync frequency (default: `everysec`).
+* `--aof-file <path>`: AOF file location (default: `miniredis.aof`).
 
 ---
 
