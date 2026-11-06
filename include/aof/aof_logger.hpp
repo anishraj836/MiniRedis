@@ -11,6 +11,17 @@
 
 namespace miniredis {
 
+/**
+ * @brief Append-only file writer.
+ *
+ * Writers append RESP-encoded commands to an in-memory buffer. A background
+ * thread writes the buffer out once per second (and fsyncs under EVERYSEC);
+ * under ALWAYS the caller writes and fsyncs before returning.
+ *
+ * Locking: file_mutex_ serializes every write to the file and every change of
+ * fd_, so buffered chunks always reach the disk in the order they were
+ * appended. buffer_mutex_ guards the buffers. Lock order: file -> buffer.
+ */
 class AofLogger {
 public:
     explicit AofLogger(std::string filename = "miniredis.aof",
@@ -21,42 +32,53 @@ public:
     AofLogger& operator=(const AofLogger&) = delete;
 
     bool open();
-    bool reopen(const std::string& new_filename = "");
     void close();
+    [[nodiscard]] bool is_open() const noexcept { return open_.load(std::memory_order_acquire); }
 
     void append(const std::vector<std::string>& tokens);
     void append_raw(const std::string& raw_bytes);
 
-    void set_policy(AofFsyncPolicy policy) noexcept { policy_ = policy; }
-    [[nodiscard]] AofFsyncPolicy policy() const noexcept { return policy_; }
+    void set_policy(AofFsyncPolicy policy) noexcept { policy_.store(policy, std::memory_order_relaxed); }
+    [[nodiscard]] AofFsyncPolicy policy() const noexcept { return policy_.load(std::memory_order_relaxed); }
     [[nodiscard]] const std::string& filename() const noexcept { return filename_; }
 
+    // Write everything buffered so far and fsync it.
     void sync();
 
-    // Delta buffer management for BGREWRITEAOF
+    // ---- BGREWRITEAOF support -------------------------------------------
+    // Start copying every appended command into the rewrite delta. Must be
+    // called at the same instant the snapshot is taken (with writes paused).
     void start_rewrite_delta();
-    std::string finish_rewrite_delta();
+    // Finish a rewrite: append the delta to temp_fd, fsync it, atomically
+    // rename temp_path over target_path and, if target_path is this logger's
+    // file, switch future appends to the new file. Appends are blocked only
+    // for the final small step. Takes ownership of temp_fd.
+    bool complete_rewrite(int temp_fd, const std::string& temp_path, const std::string& target_path);
+    // Stop collecting the delta and discard it (rewrite failed).
+    void abort_rewrite();
     [[nodiscard]] bool is_collecting_delta() const;
 
 private:
     void background_flush_worker();
+    // Requires file_mutex_. Writes out the primary buffer, then fsyncs if asked.
+    void flush_locked(bool do_fsync);
 
     std::string filename_;
-    AofFsyncPolicy policy_;
-    int fd_{-1};
+    std::atomic<AofFsyncPolicy> policy_;
 
-    std::mutex buffer_mutex_;
+    std::mutex file_mutex_;
+    int fd_{-1};          // guarded by file_mutex_
+    bool dirty_{false};   // written since last fsync; guarded by file_mutex_
+    std::atomic<bool> open_{false};
+
+    mutable std::mutex buffer_mutex_;
     std::condition_variable cv_;
     std::string primary_buffer_;
-    std::string secondary_buffer_;
+    bool collecting_delta_{false};
+    std::string delta_buffer_;
 
     std::atomic<bool> running_{false};
     std::thread flusher_thread_;
-
-    // Delta buffer for BGREWRITEAOF
-    std::mutex delta_mutex_;
-    bool collecting_delta_{false};
-    std::string delta_buffer_;
 };
 
 } // namespace miniredis

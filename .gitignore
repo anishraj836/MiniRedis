@@ -1,6 +1,7 @@
 # Build outputs & binaries
 bin/
 *.o
+*.d
 *.a
 *.so
 *.dylib

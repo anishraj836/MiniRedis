@@ -1,4 +1,5 @@
 #include "client/redis_client.hpp"
+#include "common/tokenizer.hpp"
 #include <iostream>
 #include <string>
 #include <vector>
@@ -104,23 +105,12 @@ int main(int argc, char* argv[]) {
             break;
         }
 
-        // Tokenize line respecting quotes
         std::vector<std::string> tokens;
-        std::string token;
-        bool in_quotes = false;
-        for (char c : line) {
-            if (c == '"') {
-                in_quotes = !in_quotes;
-            } else if ((c == ' ' || c == '\t') && !in_quotes) {
-                if (!token.empty()) {
-                    tokens.push_back(token);
-                    token.clear();
-                }
-            } else {
-                token += c;
-            }
+        std::string parse_error;
+        if (!miniredis::tokenize_command_line(line, tokens, parse_error)) {
+            std::cout << "\033[31m(error) " << parse_error << "\033[0m\n";
+            continue;
         }
-        if (!token.empty()) tokens.push_back(token);
 
         if (tokens.empty()) continue;
 

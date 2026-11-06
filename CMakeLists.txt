@@ -37,6 +37,7 @@ set(CORE_SOURCES
     src/aof/aof_rewriter.cpp
     src/aof/aof_recovery.cpp
     src/server/command_registry.cpp
+    src/server/command_rewrite.cpp
     src/server/redis_server.cpp
     src/server/commands_string.cpp
     src/server/commands_hash.cpp
@@ -47,10 +48,10 @@ set(CORE_SOURCES
     src/client/redis_client.cpp
 )
 
+find_package(Threads REQUIRED)
+
 add_library(miniredis_core STATIC ${CORE_SOURCES})
 target_link_libraries(miniredis_core PUBLIC Threads::Threads)
-
-find_package(Threads REQUIRED)
 
 # Executables
 add_executable(miniredis-server src/server/main_server.cpp)
@@ -65,34 +66,27 @@ target_link_libraries(miniredis-bench PRIVATE miniredis_core Threads::Threads)
 # Unit & Integration Tests
 enable_testing()
 
-add_executable(test_byte_buffer tests/unit/test_byte_buffer.cpp)
-target_link_libraries(test_byte_buffer PRIVATE miniredis_core Threads::Threads)
-add_test(NAME test_byte_buffer COMMAND test_byte_buffer)
+set(TEST_SOURCES
+    tests/unit/test_byte_buffer.cpp
+    tests/unit/test_resp_parser.cpp
+    tests/unit/test_storage_engine.cpp
+    tests/unit/test_lru_eviction.cpp
+    tests/unit/test_ttl_expiration.cpp
+    tests/unit/test_aof_recovery.cpp
+    tests/integration/test_server_commands.cpp
+    tests/integration/test_concurrent_load.cpp
+    tests/edge/test_edge_protocol.cpp
+    tests/edge/test_edge_storage.cpp
+    tests/edge/test_edge_eviction.cpp
+    tests/edge/test_edge_ttl.cpp
+    tests/edge/test_edge_aof.cpp
+    tests/edge/test_edge_network.cpp
+    tests/edge/test_regressions.cpp
+)
 
-add_executable(test_resp_parser tests/unit/test_resp_parser.cpp)
-target_link_libraries(test_resp_parser PRIVATE miniredis_core Threads::Threads)
-add_test(NAME test_resp_parser COMMAND test_resp_parser)
-
-add_executable(test_storage_engine tests/unit/test_storage_engine.cpp)
-target_link_libraries(test_storage_engine PRIVATE miniredis_core Threads::Threads)
-add_test(NAME test_storage_engine COMMAND test_storage_engine)
-
-add_executable(test_lru_eviction tests/unit/test_lru_eviction.cpp)
-target_link_libraries(test_lru_eviction PRIVATE miniredis_core Threads::Threads)
-add_test(NAME test_lru_eviction COMMAND test_lru_eviction)
-
-add_executable(test_ttl_expiration tests/unit/test_ttl_expiration.cpp)
-target_link_libraries(test_ttl_expiration PRIVATE miniredis_core Threads::Threads)
-add_test(NAME test_ttl_expiration COMMAND test_ttl_expiration)
-
-add_executable(test_aof_recovery tests/unit/test_aof_recovery.cpp)
-target_link_libraries(test_aof_recovery PRIVATE miniredis_core Threads::Threads)
-add_test(NAME test_aof_recovery COMMAND test_aof_recovery)
-
-add_executable(test_server_commands tests/integration/test_server_commands.cpp)
-target_link_libraries(test_server_commands PRIVATE miniredis_core Threads::Threads)
-add_test(NAME test_server_commands COMMAND test_server_commands)
-
-add_executable(test_concurrent_load tests/integration/test_concurrent_load.cpp)
-target_link_libraries(test_concurrent_load PRIVATE miniredis_core Threads::Threads)
-add_test(NAME test_concurrent_load COMMAND test_concurrent_load)
+foreach(test_src ${TEST_SOURCES})
+    get_filename_component(test_name ${test_src} NAME_WE)
+    add_executable(${test_name} ${test_src})
+    target_link_libraries(${test_name} PRIVATE miniredis_core Threads::Threads)
+    add_test(NAME ${test_name} COMMAND ${test_name})
+endforeach()

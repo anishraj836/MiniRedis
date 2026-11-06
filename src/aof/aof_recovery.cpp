@@ -23,20 +23,35 @@ bool AofRecovery::replay_file(const std::string& filename, StorageEngine& engine
 
     ByteBuffer buffer(65536);
     RespParser parser;
-    char chunk[16384];
+    char chunk[65536];
+    size_t bytes_read_total = 0;
+    size_t bytes_consumed = 0; // end offset of the last complete command
 
     LOG_INFO("Replaying AOF persistence file: " + filename);
 
     while (true) {
-        ssize_t bytes_read = ::read(fd, chunk, sizeof(chunk));
-        if (bytes_read > 0) {
-            buffer.append(chunk, bytes_read);
+        ssize_t n = ::read(fd, chunk, sizeof(chunk));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            LOG_ERROR("Failed to read AOF file " + filename + ": " + strerror(errno));
+            ::close(fd);
+            return false;
+        }
+        if (n > 0) {
+            buffer.append(chunk, static_cast<size_t>(n));
+            bytes_read_total += static_cast<size_t>(n);
         }
 
-        // Parse and execute commands from buffer
         while (true) {
             std::vector<std::string> cmd_tokens;
-            ParseResult res = parser.parse_command(buffer, cmd_tokens);
+            size_t before = buffer.readable_bytes();
+            // The logger only ever writes RESP arrays. Anything else would be
+            // accepted by the inline-command parser and silently skipped as an
+            // unknown command, hiding corruption.
+            ParseResult res = (!buffer.empty() && *buffer.peek() != '*')
+                                  ? ParseResult::ERROR
+                                  : parser.parse_command(buffer, cmd_tokens);
+            bytes_consumed += before - buffer.readable_bytes();
 
             if (res == ParseResult::OK) {
                 Command cmd(std::move(cmd_tokens));
@@ -45,17 +60,33 @@ bool AofRecovery::replay_file(const std::string& filename, StorageEngine& engine
             } else if (res == ParseResult::INCOMPLETE) {
                 break; // Need more data from file
             } else {
-                LOG_WARN("Corrupted frame encountered during AOF recovery at command #" + std::to_string(replayed_count + 1));
-                break;
+                LOG_ERROR("AOF file " + filename + " is corrupted at byte offset " + std::to_string(bytes_consumed) +
+                          " (after command #" + std::to_string(replayed_count) + "). Refusing to load a partial "
+                          "dataset; repair or move the file away and restart.");
+                ::close(fd);
+                return false;
             }
         }
 
-        if (bytes_read <= 0) {
+        if (n == 0) {
             break;
         }
     }
-
     ::close(fd);
+
+    if (bytes_consumed < bytes_read_total) {
+        // Torn write at the end of the file (crash or power loss mid-append).
+        // Cut it off: otherwise new commands would be appended after the
+        // garbage and become unreadable on the next restart.
+        LOG_WARN("AOF file " + filename + " ends with an incomplete command (" +
+                 std::to_string(bytes_read_total - bytes_consumed) + " bytes). Truncating to offset " +
+                 std::to_string(bytes_consumed) + ".");
+        if (::truncate(filename.c_str(), static_cast<off_t>(bytes_consumed)) < 0) {
+            LOG_ERROR("Failed to truncate AOF file " + filename + ": " + strerror(errno));
+            return false;
+        }
+    }
+
     LOG_INFO("AOF Recovery complete. Successfully reconstituted " + std::to_string(replayed_count) + " commands.");
     return true;
 }

@@ -1,86 +1,159 @@
 #include "server/command_registry.hpp"
+#include "server/command_helpers.hpp"
 #include "server/redis_server.hpp"
-#include <charconv>
+#include <algorithm>
+#include <cctype>
+
+// Atomicity note: read-modify-write handlers (INCR, APPEND, SETNX, SET NX/XX...)
+// read and then write in separate storage calls. They are atomic because
+// RedisServer runs every write command while holding the lock stripes of all
+// the keys it touches (see KeyLockTable), so no other writer can interleave.
 
 namespace miniredis {
+
+namespace {
+
+std::string to_upper(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::toupper(c); });
+    return s;
+}
+
+RespValue invalid_expire(const char* cmd_name) {
+    return RespValue::make_error(std::string("ERR invalid expire time in '") + cmd_name + "' command");
+}
+
+RespValue incr_by(const Command& cmd, StorageEngine& engine, int64_t delta) {
+    const std::string& key = cmd.arg(0);
+    std::string current_str;
+    int64_t current = 0;
+
+    switch (engine.get_string_checked(key, current_str)) {
+        case LookupStatus::WRONG_TYPE:
+            // Previously the hash/list/set was silently overwritten with a number.
+            return wrongtype_error();
+        case LookupStatus::FOUND:
+            if (!parse_int64_strict(current_str, current)) {
+                return not_integer_error();
+            }
+            break;
+        case LookupStatus::MISSING:
+            break;
+    }
+
+    int64_t next = 0;
+    if (__builtin_add_overflow(current, delta, &next)) {
+        return RespValue::make_error("ERR increment or decrement would overflow");
+    }
+
+    // keep_ttl: INCR must not make a key with a TTL persistent.
+    if (!engine.set_string(key, std::to_string(next), -1, /*keep_ttl=*/true)) {
+        return oom_error();
+    }
+    return RespValue::make_integer(next);
+}
+
+} // anonymous namespace
 
 // GET key
 RespValue handle_get(const Command& cmd, StorageEngine& engine, RedisServer* server) {
     const std::string& key = cmd.arg(0);
-    auto val = engine.get_string(key);
-    if (val.has_value()) {
-        if (server) server->stats().record_hit();
-        return RespValue::make_bulk_string(val.value());
-    } else {
-        if (server) server->stats().record_miss();
-        return RespValue::make_null_bulk();
+    std::string val;
+    switch (engine.get_string_checked(key, val)) {
+        case LookupStatus::FOUND:
+            if (server) server->stats().record_hit();
+            return RespValue::make_bulk_string(std::move(val));
+        case LookupStatus::WRONG_TYPE:
+            return wrongtype_error();
+        case LookupStatus::MISSING:
+            break;
     }
+    if (server) server->stats().record_miss();
+    return RespValue::make_null_bulk();
 }
 
-// SET key value [NX | XX] [GET] [EX seconds | PX milliseconds]
+// SET key value [NX | XX] [GET] [EX seconds | PX milliseconds | EXAT unix-s | PXAT unix-ms | KEEPTTL]
 RespValue handle_set(const Command& cmd, StorageEngine& engine, RedisServer*) {
     const std::string& key = cmd.arg(0);
     const std::string& val = cmd.arg(1);
+    const auto& tokens = cmd.tokens();
 
     bool nx = false;
     bool xx = false;
+    bool get = false;
+    bool keep_ttl = false;
+    int expiry_options = 0;
     int64_t expire_at_ms = -1;
 
-    for (size_t i = 2; i < cmd.tokens().size(); ++i) {
-        std::string opt = cmd.tokens()[i];
-        std::transform(opt.begin(), opt.end(), opt.begin(), [](unsigned char c) { return std::toupper(c); });
+    // Options start after key and value (index 2 is the value, not an option)
+    for (size_t i = 3; i < tokens.size(); ++i) {
+        const std::string opt = to_upper(tokens[i]);
+        const bool has_arg = i + 1 < tokens.size();
 
         if (opt == "NX") {
             nx = true;
         } else if (opt == "XX") {
             xx = true;
-        } else if (opt == "EX" && i + 1 < cmd.tokens().size()) {
-            int64_t sec = 0;
-            auto [p, ec] = std::from_chars(cmd.tokens()[i + 1].data(), cmd.tokens()[i + 1].data() + cmd.tokens()[i + 1].size(), sec);
-            if (ec != std::errc() || sec <= 0) return RespValue::make_error("ERR invalid expire time in set");
-            expire_at_ms = now_ms() + sec * 1000;
+        } else if (opt == "GET") {
+            get = true;
+        } else if (opt == "KEEPTTL") {
+            keep_ttl = true;
+            ++expiry_options;
+        } else if ((opt == "EX" || opt == "PX" || opt == "EXAT" || opt == "PXAT") && has_arg) {
+            int64_t n = 0;
+            if (!parse_int64_strict(tokens[i + 1], n)) return not_integer_error();
+            if (n <= 0) return invalid_expire("set");
+
+            bool ok = true;
+            if (opt == "EX")        ok = relative_ttl_to_deadline(n, 1000, expire_at_ms);
+            else if (opt == "PX")   ok = relative_ttl_to_deadline(n, 1, expire_at_ms);
+            else if (opt == "EXAT") ok = checked_mul_add(n, 1000, 0, expire_at_ms);
+            else                    expire_at_ms = n;
+            if (!ok) return invalid_expire("set");
+
+            ++expiry_options;
             ++i;
-        } else if (opt == "PX" && i + 1 < cmd.tokens().size()) {
-            int64_t ms = 0;
-            auto [p, ec] = std::from_chars(cmd.tokens()[i + 1].data(), cmd.tokens()[i + 1].data() + cmd.tokens()[i + 1].size(), ms);
-            if (ec != std::errc() || ms <= 0) return RespValue::make_error("ERR invalid expire time in set");
-            expire_at_ms = now_ms() + ms;
-            ++i;
+        } else {
+            // Unknown option, or EX/PX/EXAT/PXAT without a value
+            return RespValue::make_error("ERR syntax error");
         }
     }
 
-    if (nx && xx) {
+    if ((nx && xx) || expiry_options > 1) {
         return RespValue::make_error("ERR syntax error");
     }
 
-    bool exists = engine.exists(key);
-    if (nx && exists) {
-        return RespValue::make_null_bulk();
-    }
-    if (xx && !exists) {
-        return RespValue::make_null_bulk();
+    RespValue old_value = RespValue::make_null_bulk();
+    if (get) {
+        std::string old;
+        LookupStatus st = engine.get_string_checked(key, old);
+        if (st == LookupStatus::WRONG_TYPE) return wrongtype_error();
+        if (st == LookupStatus::FOUND) old_value = RespValue::make_bulk_string(std::move(old));
     }
 
-    bool ok = engine.set_string(key, val, expire_at_ms);
-    if (!ok) {
-        return RespValue::make_error("OOM command not allowed when used memory > maxmemory");
+    bool exists = engine.exists(key);
+    if ((nx && exists) || (xx && !exists)) {
+        return get ? old_value : RespValue::make_null_bulk();
     }
-    return RespValue::make_ok();
+
+    if (!engine.set_string(key, val, expire_at_ms, keep_ttl)) {
+        return oom_error();
+    }
+    return get ? old_value : RespValue::make_ok();
 }
 
 // SETEX key seconds value
 RespValue handle_setex(const Command& cmd, StorageEngine& engine, RedisServer*) {
     const std::string& key = cmd.arg(0);
     int64_t sec = 0;
-    auto [p, ec] = std::from_chars(cmd.arg(1).data(), cmd.arg(1).data() + cmd.arg(1).size(), sec);
-    if (ec != std::errc() || sec <= 0) {
-        return RespValue::make_error("ERR invalid expire time in 'setex' command");
-    }
-    const std::string& val = cmd.arg(2);
-    int64_t exp = now_ms() + sec * 1000;
+    if (!parse_int64_strict(cmd.arg(1), sec)) return not_integer_error();
 
-    if (!engine.set_string(key, val, exp)) {
-        return RespValue::make_error("OOM command not allowed when used memory > maxmemory");
+    int64_t exp = 0;
+    if (sec <= 0 || !relative_ttl_to_deadline(sec, 1000, exp)) {
+        return invalid_expire("setex");
+    }
+
+    if (!engine.set_string(key, cmd.arg(2), exp)) {
+        return oom_error();
     }
     return RespValue::make_ok();
 }
@@ -94,7 +167,7 @@ RespValue handle_setnx(const Command& cmd, StorageEngine& engine, RedisServer*) 
         return RespValue::make_integer(0);
     }
     if (!engine.set_string(key, val)) {
-        return RespValue::make_error("OOM command not allowed when used memory > maxmemory");
+        return oom_error();
     }
     return RespValue::make_integer(1);
 }
@@ -123,40 +196,29 @@ RespValue handle_exists(const Command& cmd, StorageEngine& engine, RedisServer*)
 
 // INCR key
 RespValue handle_incr(const Command& cmd, StorageEngine& engine, RedisServer*) {
-    const std::string& key = cmd.arg(0);
-    auto val_opt = engine.get_string(key);
-    int64_t current = 0;
-
-    if (val_opt.has_value()) {
-        const auto& s = val_opt.value();
-        auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), current);
-        if (ec != std::errc() || p != s.data() + s.size()) {
-            return RespValue::make_error("ERR value is not an integer or out of range");
-        }
-    }
-
-    ++current;
-    engine.set_string(key, std::to_string(current));
-    return RespValue::make_integer(current);
+    return incr_by(cmd, engine, 1);
 }
 
 // DECR key
 RespValue handle_decr(const Command& cmd, StorageEngine& engine, RedisServer*) {
-    const std::string& key = cmd.arg(0);
-    auto val_opt = engine.get_string(key);
-    int64_t current = 0;
+    return incr_by(cmd, engine, -1);
+}
 
-    if (val_opt.has_value()) {
-        const auto& s = val_opt.value();
-        auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), current);
-        if (ec != std::errc() || p != s.data() + s.size()) {
-            return RespValue::make_error("ERR value is not an integer or out of range");
-        }
+// INCRBY key increment
+RespValue handle_incrby(const Command& cmd, StorageEngine& engine, RedisServer*) {
+    int64_t delta = 0;
+    if (!parse_int64_strict(cmd.arg(1), delta)) return not_integer_error();
+    return incr_by(cmd, engine, delta);
+}
+
+// DECRBY key decrement
+RespValue handle_decrby(const Command& cmd, StorageEngine& engine, RedisServer*) {
+    int64_t delta = 0;
+    if (!parse_int64_strict(cmd.arg(1), delta)) return not_integer_error();
+    if (delta == std::numeric_limits<int64_t>::min()) {
+        return RespValue::make_error("ERR decrement would overflow");
     }
-
-    --current;
-    engine.set_string(key, std::to_string(current));
-    return RespValue::make_integer(current);
+    return incr_by(cmd, engine, -delta);
 }
 
 // MGET key [key ...]
@@ -196,7 +258,7 @@ RespValue handle_mset(const Command& cmd, StorageEngine& engine, RedisServer*) {
     }
 
     if (!engine.mset(kvs)) {
-        return RespValue::make_error("OOM command not allowed when used memory > maxmemory");
+        return oom_error();
     }
     return RespValue::make_ok();
 }
@@ -206,26 +268,27 @@ RespValue handle_append(const Command& cmd, StorageEngine& engine, RedisServer*)
     const std::string& key = cmd.arg(0);
     const std::string& append_str = cmd.arg(1);
 
-    auto val_opt = engine.get_string(key);
     std::string new_val;
-    if (val_opt.has_value()) {
-        new_val = val_opt.value() + append_str;
-    } else {
-        new_val = append_str;
+    if (engine.get_string_checked(key, new_val) == LookupStatus::WRONG_TYPE) {
+        return wrongtype_error();
     }
+    new_val += append_str;
 
-    engine.set_string(key, new_val);
+    if (!engine.set_string(key, new_val, -1, /*keep_ttl=*/true)) {
+        return oom_error();
+    }
     return RespValue::make_integer(static_cast<int64_t>(new_val.size()));
 }
 
 // STRLEN key
 RespValue handle_strlen(const Command& cmd, StorageEngine& engine, RedisServer*) {
-    const std::string& key = cmd.arg(0);
-    auto val_opt = engine.get_string(key);
-    if (!val_opt.has_value()) {
-        return RespValue::make_integer(0);
+    std::string val;
+    switch (engine.get_string_checked(cmd.arg(0), val)) {
+        case LookupStatus::WRONG_TYPE: return wrongtype_error();
+        case LookupStatus::FOUND:      return RespValue::make_integer(static_cast<int64_t>(val.size()));
+        case LookupStatus::MISSING:    break;
     }
-    return RespValue::make_integer(static_cast<int64_t>(val_opt.value().size()));
+    return RespValue::make_integer(0);
 }
 
 } // namespace miniredis

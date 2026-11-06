@@ -113,8 +113,9 @@ void EventLoop::do_pending_tasks() {
 
 void EventLoop::loop() {
     looping_ = true;
-    quit_ = false;
-    thread_id_ = std::this_thread::get_id();
+    // Do not reset quit_ here: a stop() issued before the loop got to run
+    // would otherwise be lost and the loop would never exit.
+    thread_id_.store(std::this_thread::get_id(), std::memory_order_release);
 
     std::vector<FdEvent> active_events;
     active_events.reserve(256);
