@@ -31,6 +31,19 @@ public:
     // Peek Least Recently Used key
     [[nodiscard]] std::optional<std::string> peek_lru() const;
 
+    // Returns the least recently used key matching `pred`, looking at no more
+    // than `max_scan` keys from the LRU end.
+    template <typename Pred>
+    [[nodiscard]] std::optional<std::string> find_lru_if(Pred pred, size_t max_scan) const {
+        size_t scanned = 0;
+        for (auto it = key_list_.rbegin(); it != key_list_.rend() && scanned < max_scan; ++it, ++scanned) {
+            if (pred(*it)) {
+                return *it;
+            }
+        }
+        return std::nullopt;
+    }
+
     [[nodiscard]] size_t size() const noexcept {
         return key_map_.size();
     }

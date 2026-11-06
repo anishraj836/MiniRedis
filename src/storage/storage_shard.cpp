@@ -4,6 +4,29 @@
 
 namespace miniredis {
 
+namespace {
+
+// Per-element costs. These must match ValueObject::estimate_memory() exactly:
+// collection writes update the shard counter incrementally with them (O(1) per
+// element) instead of re-estimating the whole collection on every write (O(n)).
+size_t list_item_cost(const std::string& item) noexcept {
+    return sizeof(void*) * 2 + sizeof(std::string) + item.capacity();
+}
+
+size_t hash_field_cost(const std::string& field, const std::string& value) noexcept {
+    return sizeof(void*) * 3 + field.capacity() + value.capacity();
+}
+
+size_t set_member_cost(const std::string& member) noexcept {
+    return sizeof(void*) * 3 + member.capacity();
+}
+
+ssize_t bucket_delta(size_t before, size_t after) noexcept {
+    return (static_cast<ssize_t>(after) - static_cast<ssize_t>(before)) * static_cast<ssize_t>(sizeof(void*));
+}
+
+} // anonymous namespace
+
 StorageShard::StorageShard(MemoryTracker* mem_tracker)
     : mem_tracker_(mem_tracker) {}
 
@@ -36,37 +59,48 @@ bool StorageShard::try_evict_for_space(size_t required_bytes) {
     return !mem_tracker_->is_out_of_memory(required_bytes);
 }
 
+bool StorageShard::reserve_memory_locked(size_t bytes) {
+    return try_evict_for_space(bytes);
+}
+
+void StorageShard::erase_locked(DataMap::iterator it) {
+    update_memory_delta(-static_cast<ssize_t>(entry_cost(it->first, it->second)));
+    lru_.erase(it->first);
+    ttl_manager_.remove_expiry(it->first);
+    data_.erase(it);
+}
+
 bool StorageShard::check_and_purge_expired_locked(const std::string& key, int64_t now) {
     auto it = data_.find(key);
     if (it == data_.end()) return false;
 
     if (it->second.is_expired(now)) {
-        size_t mem = it->second.estimate_memory() + key.capacity() + sizeof(void*);
-        update_memory_delta(-static_cast<ssize_t>(mem));
-        lru_.erase(key);
-        ttl_manager_.remove_expiry(key);
-        data_.erase(it);
+        erase_locked(it);
         return true;
     }
     return false;
 }
 
-bool StorageShard::set(const std::string& key, ValueObject value) {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+bool StorageShard::set_locked(const std::string& key, ValueObject value, bool keep_ttl, bool skip_admission) {
     int64_t now = now_ms();
     check_and_purge_expired_locked(key, now);
 
-    size_t new_mem = value.estimate_memory() + key.capacity() + sizeof(void*);
-    size_t old_mem = 0;
-
     auto it = data_.find(key);
-    if (it != data_.end()) {
-        old_mem = it->second.estimate_memory() + key.capacity() + sizeof(void*);
+    if (keep_ttl && it != data_.end()) {
+        value.expire_at_ms = it->second.expire_at_ms;
     }
 
-    ssize_t delta = static_cast<ssize_t>(new_mem) - static_cast<ssize_t>(old_mem);
-    if (delta > 0 && !try_evict_for_space(delta)) {
-        return false; // Out of memory and eviction failed / noeviction
+    if (!skip_admission) {
+        size_t old_cost = (it != data_.end()) ? entry_cost(it->first, it->second) : 0;
+        size_t new_cost = value.estimate_memory() + key.capacity() + sizeof(void*);
+        if (new_cost > old_cost) {
+            // Don't let the key we are about to overwrite be picked as the victim.
+            if (it != data_.end()) lru_.touch(key);
+            if (!try_evict_for_space(new_cost - old_cost)) {
+                return false; // Out of memory and eviction failed / noeviction
+            }
+            it = data_.find(key); // eviction may have removed it
+        }
     }
 
     if (value.expire_at_ms >= 0) {
@@ -76,55 +110,78 @@ bool StorageShard::set(const std::string& key, ValueObject value) {
     }
 
     lru_.insert(key);
-    data_[key] = std::move(value);
-    update_memory_delta(delta);
+    if (it != data_.end()) {
+        size_t old_cost = entry_cost(it->first, it->second);
+        it->second = std::move(value);
+        update_memory_delta(static_cast<ssize_t>(entry_cost(it->first, it->second)) - static_cast<ssize_t>(old_cost));
+    } else {
+        it = data_.emplace(key, std::move(value)).first;
+        update_memory_delta(static_cast<ssize_t>(entry_cost(it->first, it->second)));
+    }
     return true;
 }
 
-bool StorageShard::set_string(const std::string& key, std::string val, int64_t expire_at_ms) {
-    return set(key, ValueObject::make_string(std::move(val), expire_at_ms));
+bool StorageShard::set(const std::string& key, ValueObject value, bool keep_ttl) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    return set_locked(key, std::move(value), keep_ttl, false);
 }
 
-std::optional<std::string> StorageShard::get_string(const std::string& key) {
-    // Acquire shared lock for concurrent reads
+bool StorageShard::set_string(const std::string& key, std::string val, int64_t expire_at_ms, bool keep_ttl) {
+    return set(key, ValueObject::make_string(std::move(val), expire_at_ms), keep_ttl);
+}
+
+std::optional<std::string> StorageShard::get_string_shared_locked(const std::string& key, int64_t now) {
+    auto it = data_.find(key);
+    if (it == data_.end() || it->second.is_expired(now) || it->second.type != RedisType::STRING) {
+        return std::nullopt;
+    }
+    {
+        SpinLockGuard lru_guard(lru_lock_);
+        lru_.touch(key);
+    }
+    return it->second.as_string();
+}
+
+LookupStatus StorageShard::get_string_checked(const std::string& key, std::string& out) {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     int64_t now = now_ms();
 
     auto it = data_.find(key);
     if (it == data_.end()) {
-        return std::nullopt;
+        return LookupStatus::MISSING;
     }
 
     if (it->second.is_expired(now)) {
-        // Upgrade to unique lock to erase expired key
         lock.unlock();
         std::unique_lock<std::shared_mutex> write_lock(mutex_);
         check_and_purge_expired_locked(key, now);
-        return std::nullopt;
+        return LookupStatus::MISSING;
     }
 
     if (it->second.type != RedisType::STRING) {
-        return std::nullopt;
+        return LookupStatus::WRONG_TYPE;
     }
 
-    // Touch LRU list under fast spinlock
     {
         SpinLockGuard lru_guard(lru_lock_);
         lru_.touch(key);
     }
+    out = it->second.as_string();
+    return LookupStatus::FOUND;
+}
 
-    return it->second.as_string();
+std::optional<std::string> StorageShard::get_string(const std::string& key) {
+    std::string out;
+    if (get_string_checked(key, out) == LookupStatus::FOUND) {
+        return out;
+    }
+    return std::nullopt;
 }
 
 bool StorageShard::del_locked(const std::string& key) {
     auto it = data_.find(key);
     if (it == data_.end()) return false;
-
-    size_t mem = it->second.estimate_memory() + key.capacity() + sizeof(void*);
-    update_memory_delta(-static_cast<ssize_t>(mem));
-    lru_.erase(key);
-    ttl_manager_.remove_expiry(key);
-    data_.erase(it);
+    erase_locked(it);
     return true;
 }
 
@@ -212,37 +269,72 @@ bool StorageShard::persist(const std::string& key) {
     return true;
 }
 
-int StorageShard::hset(const std::string& key, const std::vector<std::pair<std::string, std::string>>& field_values) {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
+StorageShard::DataMap::iterator StorageShard::prepare_collection_write_locked(
+        const std::string& key, RedisType type, size_t incoming_bytes, int64_t& status) {
     int64_t now = now_ms();
     check_and_purge_expired_locked(key, now);
 
     auto it = data_.find(key);
-    if (it != data_.end() && it->second.type != RedisType::HASH) {
-        return -1; // Type mismatch
+    if (it != data_.end() && it->second.type != type) {
+        status = WRONG_TYPE;
+        return data_.end();
     }
 
-    size_t old_mem = 0;
-    if (it == data_.end()) {
-        data_[key] = ValueObject::make_hash();
-        it = data_.find(key);
-    } else {
-        old_mem = it->second.estimate_memory();
+    // maxmemory applies to collections too, not only to SET.
+    if (it != data_.end()) lru_.touch(key);
+    size_t needed = incoming_bytes + (it == data_.end() ? sizeof(ValueObject) + 48 + key.capacity() + sizeof(void*) : 0);
+    if (!try_evict_for_space(needed)) {
+        status = OUT_OF_MEMORY;
+        return data_.end();
     }
+    it = data_.find(key); // eviction may have removed it
+
+    if (it == data_.end()) {
+        ValueObject value;
+        switch (type) {
+            case RedisType::HASH: value = ValueObject::make_hash(); break;
+            case RedisType::LIST: value = ValueObject::make_list(); break;
+            case RedisType::SET:  value = ValueObject::make_set(); break;
+            default:              value = ValueObject::make_string(""); break;
+        }
+        it = data_.emplace(key, std::move(value)).first;
+        update_memory_delta(static_cast<ssize_t>(entry_cost(it->first, it->second)));
+    }
+    lru_.insert(key);
+    status = 0;
+    return it;
+}
+
+int64_t StorageShard::hset(const std::string& key, const std::vector<std::pair<std::string, std::string>>& field_values) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+
+    size_t incoming = 0;
+    for (const auto& [f, v] : field_values) incoming += sizeof(void*) * 3 + f.size() + v.size();
+
+    int64_t status = 0;
+    auto it = prepare_collection_write_locked(key, RedisType::HASH, incoming, status);
+    if (status < 0) return status;
 
     auto& hash_map = it->second.as_hash();
-    int added_count = 0;
+    size_t buckets_before = hash_map.bucket_count();
+    ssize_t delta = 0;
+    int64_t added_count = 0;
 
     for (const auto& [f, v] : field_values) {
-        auto [fit, inserted] = hash_map.insert_or_assign(f, v);
-        if (inserted) ++added_count;
+        auto fit = hash_map.find(f);
+        if (fit != hash_map.end()) {
+            size_t old_cap = fit->second.capacity();
+            fit->second = v;
+            delta += static_cast<ssize_t>(fit->second.capacity()) - static_cast<ssize_t>(old_cap);
+        } else {
+            auto nit = hash_map.emplace(f, v).first;
+            delta += static_cast<ssize_t>(hash_field_cost(nit->first, nit->second));
+            ++added_count;
+        }
     }
 
-    size_t new_mem = it->second.estimate_memory();
-    ssize_t delta = static_cast<ssize_t>(new_mem) - static_cast<ssize_t>(old_mem);
+    delta += bucket_delta(buckets_before, hash_map.bucket_count());
     update_memory_delta(delta);
-
-    lru_.insert(key);
     return added_count;
 }
 
@@ -282,18 +374,21 @@ bool StorageShard::hdel(const std::string& key, const std::string& field) {
     if (it == data_.end() || it->second.type != RedisType::HASH) return false;
 
     auto& hash_map = it->second.as_hash();
-    size_t old_mem = it->second.estimate_memory();
-    size_t erased = hash_map.erase(field);
-    if (erased > 0) {
-        if (hash_map.empty()) {
-            del_locked(key);
-        } else {
-            size_t new_mem = it->second.estimate_memory();
-            update_memory_delta(static_cast<ssize_t>(new_mem) - static_cast<ssize_t>(old_mem));
-        }
-        return true;
+    auto fit = hash_map.find(field);
+    if (fit == hash_map.end()) return false;
+
+    // Account for the removed field before anything else, otherwise deleting
+    // the last field would leak its bytes in the memory counter forever.
+    size_t buckets_before = hash_map.bucket_count();
+    ssize_t delta = -static_cast<ssize_t>(hash_field_cost(fit->first, fit->second));
+    hash_map.erase(fit);
+    delta += bucket_delta(buckets_before, hash_map.bucket_count());
+    update_memory_delta(delta);
+
+    if (hash_map.empty()) {
+        erase_locked(it);
     }
-    return false;
+    return true;
 }
 
 std::optional<std::unordered_map<std::string, std::string>> StorageShard::hgetall(const std::string& key) {
@@ -355,58 +450,44 @@ size_t StorageShard::hlen(const std::string& key) {
     return it->second.as_hash().size();
 }
 
-size_t StorageShard::lpush(const std::string& key, const std::vector<std::string>& values) {
+int64_t StorageShard::lpush(const std::string& key, const std::vector<std::string>& values) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    int64_t now = now_ms();
-    check_and_purge_expired_locked(key, now);
 
-    auto it = data_.find(key);
-    if (it != data_.end() && it->second.type != RedisType::LIST) return 0;
+    size_t incoming = 0;
+    for (const auto& v : values) incoming += sizeof(void*) * 2 + sizeof(std::string) + v.size();
 
-    size_t old_mem = 0;
-    if (it == data_.end()) {
-        data_[key] = ValueObject::make_list();
-        it = data_.find(key);
-    } else {
-        old_mem = it->second.estimate_memory();
-    }
+    int64_t status = 0;
+    auto it = prepare_collection_write_locked(key, RedisType::LIST, incoming, status);
+    if (status < 0) return status;
 
     auto& list = it->second.as_list();
+    ssize_t delta = 0;
     for (const auto& v : values) {
         list.push_front(v);
+        delta += static_cast<ssize_t>(list_item_cost(list.front()));
     }
-
-    size_t new_mem = it->second.estimate_memory();
-    update_memory_delta(static_cast<ssize_t>(new_mem) - static_cast<ssize_t>(old_mem));
-    lru_.insert(key);
-    return list.size();
+    update_memory_delta(delta);
+    return static_cast<int64_t>(list.size());
 }
 
-size_t StorageShard::rpush(const std::string& key, const std::vector<std::string>& values) {
+int64_t StorageShard::rpush(const std::string& key, const std::vector<std::string>& values) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    int64_t now = now_ms();
-    check_and_purge_expired_locked(key, now);
 
-    auto it = data_.find(key);
-    if (it != data_.end() && it->second.type != RedisType::LIST) return 0;
+    size_t incoming = 0;
+    for (const auto& v : values) incoming += sizeof(void*) * 2 + sizeof(std::string) + v.size();
 
-    size_t old_mem = 0;
-    if (it == data_.end()) {
-        data_[key] = ValueObject::make_list();
-        it = data_.find(key);
-    } else {
-        old_mem = it->second.estimate_memory();
-    }
+    int64_t status = 0;
+    auto it = prepare_collection_write_locked(key, RedisType::LIST, incoming, status);
+    if (status < 0) return status;
 
     auto& list = it->second.as_list();
+    ssize_t delta = 0;
     for (const auto& v : values) {
         list.push_back(v);
+        delta += static_cast<ssize_t>(list_item_cost(list.back()));
     }
-
-    size_t new_mem = it->second.estimate_memory();
-    update_memory_delta(static_cast<ssize_t>(new_mem) - static_cast<ssize_t>(old_mem));
-    lru_.insert(key);
-    return list.size();
+    update_memory_delta(delta);
+    return static_cast<int64_t>(list.size());
 }
 
 std::optional<std::string> StorageShard::lpop(const std::string& key) {
@@ -420,15 +501,12 @@ std::optional<std::string> StorageShard::lpop(const std::string& key) {
     auto& list = it->second.as_list();
     if (list.empty()) return std::nullopt;
 
-    size_t old_mem = it->second.estimate_memory();
+    update_memory_delta(-static_cast<ssize_t>(list_item_cost(list.front())));
     std::string val = std::move(list.front());
     list.pop_front();
 
     if (list.empty()) {
-        del_locked(key);
-    } else {
-        size_t new_mem = it->second.estimate_memory();
-        update_memory_delta(static_cast<ssize_t>(new_mem) - static_cast<ssize_t>(old_mem));
+        erase_locked(it);
     }
     return val;
 }
@@ -444,15 +522,12 @@ std::optional<std::string> StorageShard::rpop(const std::string& key) {
     auto& list = it->second.as_list();
     if (list.empty()) return std::nullopt;
 
-    size_t old_mem = it->second.estimate_memory();
+    update_memory_delta(-static_cast<ssize_t>(list_item_cost(list.back())));
     std::string val = std::move(list.back());
     list.pop_back();
 
     if (list.empty()) {
-        del_locked(key);
-    } else {
-        size_t new_mem = it->second.estimate_memory();
-        update_memory_delta(static_cast<ssize_t>(new_mem) - static_cast<ssize_t>(old_mem));
+        erase_locked(it);
     }
     return val;
 }
@@ -496,48 +571,44 @@ std::vector<std::string> StorageShard::lrange(const std::string& key, int64_t st
     if (size == 0) return {};
 
     // Standard Redis negative index translation
-    if (start < 0) start += size;
-    if (stop < 0) stop += size;
-    if (start < 0) start = 0;
+    if (start < 0) start = (start < -size) ? 0 : start + size;
+    if (stop < 0) stop = (stop < -size) ? -1 : stop + size;
     if (stop >= size) stop = size - 1;
     if (start > stop || start >= size) return {};
 
     std::vector<std::string> result;
-    result.reserve(stop - start + 1);
+    result.reserve(static_cast<size_t>(stop - start + 1));
 
     for (int64_t i = start; i <= stop; ++i) {
-        result.push_back(list[i]);
+        result.push_back(list[static_cast<size_t>(i)]);
     }
     return result;
 }
 
-size_t StorageShard::sadd(const std::string& key, const std::vector<std::string>& members) {
+int64_t StorageShard::sadd(const std::string& key, const std::vector<std::string>& members) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    int64_t now = now_ms();
-    check_and_purge_expired_locked(key, now);
 
-    auto it = data_.find(key);
-    if (it != data_.end() && it->second.type != RedisType::SET) return 0;
+    size_t incoming = 0;
+    for (const auto& m : members) incoming += sizeof(void*) * 3 + m.size();
 
-    size_t old_mem = 0;
-    if (it == data_.end()) {
-        data_[key] = ValueObject::make_set();
-        it = data_.find(key);
-    } else {
-        old_mem = it->second.estimate_memory();
-    }
+    int64_t status = 0;
+    auto it = prepare_collection_write_locked(key, RedisType::SET, incoming, status);
+    if (status < 0) return status;
 
     auto& set = it->second.as_set();
-    size_t added = 0;
+    size_t buckets_before = set.bucket_count();
+    ssize_t delta = 0;
+    int64_t added = 0;
     for (const auto& m : members) {
-        if (set.insert(m).second) {
+        auto [mit, inserted] = set.insert(m);
+        if (inserted) {
+            delta += static_cast<ssize_t>(set_member_cost(*mit));
             ++added;
         }
     }
 
-    size_t new_mem = it->second.estimate_memory();
-    update_memory_delta(static_cast<ssize_t>(new_mem) - static_cast<ssize_t>(old_mem));
-    lru_.insert(key);
+    delta += bucket_delta(buckets_before, set.bucket_count());
+    update_memory_delta(delta);
     return added;
 }
 
@@ -550,18 +621,24 @@ size_t StorageShard::srem(const std::string& key, const std::vector<std::string>
     if (it == data_.end() || it->second.type != RedisType::SET) return 0;
 
     auto& set = it->second.as_set();
-    size_t old_mem = it->second.estimate_memory();
+    size_t buckets_before = set.bucket_count();
+    ssize_t delta = 0;
     size_t removed = 0;
 
     for (const auto& m : members) {
-        removed += set.erase(m);
+        auto mit = set.find(m);
+        if (mit != set.end()) {
+            delta -= static_cast<ssize_t>(set_member_cost(*mit));
+            set.erase(mit);
+            ++removed;
+        }
     }
 
+    delta += bucket_delta(buckets_before, set.bucket_count());
+    update_memory_delta(delta);
+
     if (set.empty()) {
-        del_locked(key);
-    } else {
-        size_t new_mem = it->second.estimate_memory();
-        update_memory_delta(static_cast<ssize_t>(new_mem) - static_cast<ssize_t>(old_mem));
+        erase_locked(it);
     }
     return removed;
 }
@@ -628,92 +705,74 @@ size_t StorageShard::scard(const std::string& key) {
 }
 
 bool StorageShard::evict_one(EvictionPolicy policy) {
-    std::string key_to_evict;
+    DataMap::iterator victim = data_.end();
 
     switch (policy) {
         case EvictionPolicy::ALLKEYS_LRU: {
-            auto lru_key = lru_.pop_lru();
-            if (lru_key.has_value()) {
-                key_to_evict = std::move(lru_key.value());
+            if (auto k = lru_.peek_lru()) {
+                victim = data_.find(*k);
             }
             break;
         }
-        case EvictionPolicy::VOLATILE_LRU:
+        case EvictionPolicy::VOLATILE_LRU: {
+            // Least recently used key that has a TTL. Keys without a TTL are
+            // never eligible under volatile-* policies.
+            auto k = lru_.find_lru_if([this](const std::string& candidate) {
+                auto it = data_.find(candidate);
+                return it != data_.end() && it->second.expire_at_ms >= 0;
+            }, 64);
+            if (!k) k = ttl_manager_.soonest_key(); // fall back to any volatile key
+            if (k) victim = data_.find(*k);
+            break;
+        }
         case EvictionPolicy::VOLATILE_TTL: {
-            // Find key with earliest expiration
-            std::vector<std::string> expired;
-            if (ttl_manager_.sweep_expired(INT64_MAX, 1, expired) > 0) {
-                key_to_evict = expired[0];
-            } else {
-                auto lru_key = lru_.pop_lru();
-                if (lru_key.has_value()) key_to_evict = std::move(lru_key.value());
+            if (auto k = ttl_manager_.soonest_key()) {
+                victim = data_.find(*k);
             }
             break;
         }
         case EvictionPolicy::ALLKEYS_RANDOM: {
-            if (!data_.empty()) {
-                key_to_evict = data_.begin()->first;
+            // Pick a random non-empty bucket: data_.begin() would always evict
+            // the same few keys.
+            size_t buckets = data_.bucket_count();
+            for (int attempt = 0; attempt < 64 && victim == data_.end() && buckets > 0; ++attempt) {
+                size_t b = rng_() % buckets;
+                if (data_.bucket_size(b) > 0) {
+                    victim = data_.find(data_.begin(b)->first);
+                }
             }
+            if (victim == data_.end() && !data_.empty()) victim = data_.begin();
             break;
         }
         case EvictionPolicy::NO_EVICTION:
             return false;
     }
 
-    if (key_to_evict.empty()) return false;
+    if (victim == data_.end()) return false;
 
-    auto it = data_.find(key_to_evict);
-    if (it != data_.end()) {
-        size_t mem = it->second.estimate_memory() + key_to_evict.capacity() + sizeof(void*);
-        update_memory_delta(-static_cast<ssize_t>(mem));
-        ttl_manager_.remove_expiry(key_to_evict);
-        data_.erase(it);
-        return true;
-    }
-    return false;
+    // erase_locked keeps data_, the LRU list and the TTL index in sync. The old
+    // code skipped the LRU list for some policies, leaving stale keys there that
+    // later stopped eviction early and caused false OOM errors.
+    erase_locked(victim);
+    if (mem_tracker_) mem_tracker_->record_eviction();
+    return true;
 }
 
 size_t StorageShard::sweep_expired(size_t max_keys) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     int64_t now = now_ms();
     std::vector<std::string> expired;
-    size_t count = ttl_manager_.sweep_expired(now, max_keys, expired);
+    ttl_manager_.sweep_expired(now, max_keys, expired);
 
+    size_t removed = 0;
     for (const auto& k : expired) {
         auto it = data_.find(k);
-        if (it != data_.end()) {
-            size_t mem = it->second.estimate_memory() + k.capacity() + sizeof(void*);
-            update_memory_delta(-static_cast<ssize_t>(mem));
-            lru_.erase(k);
-            data_.erase(it);
+        if (it != data_.end() && it->second.is_expired(now)) {
+            erase_locked(it);
+            ++removed;
         }
     }
-    return count;
-}
-
-void StorageShard::sample_and_sweep(size_t sample_count, size_t& sampled, size_t& expired) {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    int64_t now = now_ms();
-
-    std::vector<std::pair<std::string, int64_t>> samples;
-    ttl_manager_.sample_keys(sample_count, samples);
-
-    sampled = samples.size();
-    expired = 0;
-
-    for (const auto& [k, exp_time] : samples) {
-        if (now >= exp_time) {
-            auto it = data_.find(k);
-            if (it != data_.end()) {
-                size_t mem = it->second.estimate_memory() + k.capacity() + sizeof(void*);
-                update_memory_delta(-static_cast<ssize_t>(mem));
-                lru_.erase(k);
-                ttl_manager_.remove_expiry(k);
-                data_.erase(it);
-                ++expired;
-            }
-        }
-    }
+    return removed;
 }
 
 void StorageShard::iterate_all(const std::function<void(const std::string& key, const ValueObject& val)>& callback) {
@@ -732,9 +791,23 @@ size_t StorageShard::key_count() const {
     return data_.size();
 }
 
+size_t StorageShard::expires_count() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return ttl_manager_.size();
+}
+
 size_t StorageShard::memory_usage() const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     return shard_memory_;
+}
+
+bool StorageShard::verify_memory_accounting() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    size_t recomputed = 0;
+    for (const auto& [k, v] : data_) {
+        recomputed += entry_cost(k, v);
+    }
+    return recomputed == shard_memory_ && lru_.size() == data_.size();
 }
 
 void StorageShard::flush() {

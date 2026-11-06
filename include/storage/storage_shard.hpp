@@ -12,11 +12,24 @@
 #include <optional>
 #include <vector>
 #include <functional>
+#include <random>
 
 namespace miniredis {
 
+// Result of a typed lookup.
+enum class LookupStatus {
+    FOUND,
+    MISSING,
+    WRONG_TYPE
+};
+
 class StorageShard {
 public:
+    // Negative return codes used by the collection write operations
+    // (hset / lpush / rpush / sadd). Non-negative values are counts.
+    static constexpr int64_t WRONG_TYPE = -1;
+    static constexpr int64_t OUT_OF_MEMORY = -2;
+
     explicit StorageShard(MemoryTracker* mem_tracker = nullptr);
     ~StorageShard() = default;
 
@@ -26,13 +39,23 @@ public:
     // Mutex direct access for multi-shard lock ordering
     std::shared_mutex& mutex() noexcept { return mutex_; }
 
-    // Core String / Generic Operations (Exclusive Locks)
-    bool set(const std::string& key, ValueObject value);
-    bool set_string(const std::string& key, std::string val, int64_t expire_at_ms = -1);
+    // Core String / Generic Operations
+    // keep_ttl: keep the key's current expiry instead of replacing it (used by
+    // INCR/APPEND and SET ... KEEPTTL).
+    bool set(const std::string& key, ValueObject value, bool keep_ttl = false);
+    bool set_string(const std::string& key, std::string val, int64_t expire_at_ms = -1, bool keep_ttl = false);
     std::optional<std::string> get_string(const std::string& key);
+    LookupStatus get_string_checked(const std::string& key, std::string& out);
     bool del(const std::string& key);
     bool exists(const std::string& key);
     std::optional<RedisType> type(const std::string& key);
+
+    // Variants for callers that already hold mutex() (multi-key MSET / MGET).
+    // skip_admission: do not run the maxmemory check (already done by caller).
+    bool set_locked(const std::string& key, ValueObject value, bool keep_ttl, bool skip_admission);
+    std::optional<std::string> get_string_shared_locked(const std::string& key, int64_t now);
+    // Frees memory for `bytes` more data; returns false when that is impossible.
+    bool reserve_memory_locked(size_t bytes);
 
     // TTL Operations
     bool expire(const std::string& key, int64_t expire_at_ms);
@@ -40,7 +63,7 @@ public:
     bool persist(const std::string& key);
 
     // Hash Operations
-    int hset(const std::string& key, const std::vector<std::pair<std::string, std::string>>& field_values);
+    int64_t hset(const std::string& key, const std::vector<std::pair<std::string, std::string>>& field_values);
     std::optional<std::string> hget(const std::string& key, const std::string& field);
     bool hdel(const std::string& key, const std::string& field);
     std::optional<std::unordered_map<std::string, std::string>> hgetall(const std::string& key);
@@ -48,15 +71,15 @@ public:
     size_t hlen(const std::string& key);
 
     // List Operations
-    size_t lpush(const std::string& key, const std::vector<std::string>& values);
-    size_t rpush(const std::string& key, const std::vector<std::string>& values);
+    int64_t lpush(const std::string& key, const std::vector<std::string>& values);
+    int64_t rpush(const std::string& key, const std::vector<std::string>& values);
     std::optional<std::string> lpop(const std::string& key);
     std::optional<std::string> rpop(const std::string& key);
     size_t llen(const std::string& key);
     std::vector<std::string> lrange(const std::string& key, int64_t start, int64_t stop);
 
     // Set Operations
-    size_t sadd(const std::string& key, const std::vector<std::string>& members);
+    int64_t sadd(const std::string& key, const std::vector<std::string>& members);
     size_t srem(const std::string& key, const std::vector<std::string>& members);
     bool sismember(const std::string& key, const std::string& member);
     std::vector<std::string> smembers(const std::string& key);
@@ -64,30 +87,51 @@ public:
 
     // Eviction and Expiration
     bool evict_one(EvictionPolicy policy);
+    // Removes up to max_keys keys whose TTL has passed, soonest first.
     size_t sweep_expired(size_t max_keys);
-    void sample_and_sweep(size_t sample_count, size_t& sampled, size_t& expired);
 
     // Direct iteration under read lock for AOF Rewrite / Snapshot
     void iterate_all(const std::function<void(const std::string& key, const ValueObject& val)>& callback);
 
     [[nodiscard]] size_t key_count() const;
+    [[nodiscard]] size_t expires_count() const;
     [[nodiscard]] size_t memory_usage() const;
     void flush();
 
+    // Recomputes the memory of every entry from scratch and compares it with
+    // the incrementally maintained counter. Used by tests to prove that no
+    // operation leaks or double-frees accounted memory.
+    [[nodiscard]] bool verify_memory_accounting() const;
+
 private:
-    // Internal helper (must be called with lock held)
+    using DataMap = std::unordered_map<std::string, ValueObject>;
+
+    // Internal helpers (must be called with the unique lock held)
     bool del_locked(const std::string& key);
+    void erase_locked(DataMap::iterator it);
     bool check_and_purge_expired_locked(const std::string& key, int64_t now);
     void update_memory_delta(ssize_t delta_bytes);
     bool try_evict_for_space(size_t required_bytes);
+    // Looks up (or creates) a collection of `type` for a write that will add
+    // roughly `incoming_bytes`. On failure sets status to WRONG_TYPE / OUT_OF_MEMORY
+    // and returns data_.end().
+    DataMap::iterator prepare_collection_write_locked(const std::string& key, RedisType type,
+                                                      size_t incoming_bytes, int64_t& status);
+
+    // Accounted cost of one entry. Always computed from the key stored in the
+    // map node, so adding and removing an entry use the same number.
+    static size_t entry_cost(const std::string& stored_key, const ValueObject& value) noexcept {
+        return value.estimate_memory() + stored_key.capacity() + sizeof(void*);
+    }
 
     mutable std::shared_mutex mutex_;
     SpinLock lru_lock_; // Internal spinlock for LRU touch under shared_lock
-    std::unordered_map<std::string, ValueObject> data_;
+    DataMap data_;
     LRUCache lru_;
     TTLManager ttl_manager_;
     size_t shard_memory_{0};
     MemoryTracker* mem_tracker_{nullptr};
+    std::minstd_rand rng_{std::random_device{}()};
 };
 
 } // namespace miniredis

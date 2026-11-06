@@ -56,7 +56,16 @@ public:
 
     [[nodiscard]] std::string format_memory_human() const;
 
+    void record_eviction() noexcept {
+        evicted_keys_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] uint64_t evicted_keys() const noexcept {
+        return evicted_keys_.load(std::memory_order_relaxed);
+    }
+
 private:
+    std::atomic<uint64_t> evicted_keys_{0};
     std::atomic<size_t> used_memory_{0};
     std::atomic<size_t> max_memory_{DEFAULT_MAX_MEMORY};
     std::atomic<EvictionPolicy> policy_{EvictionPolicy::ALLKEYS_LRU};
