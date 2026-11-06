@@ -1,7 +1,11 @@
 #include "server/command_registry.hpp"
+#include "server/command_helpers.hpp"
 #include "server/redis_server.hpp"
 #include "aof/aof_rewriter.hpp"
+#include <algorithm>
+#include <cctype>
 #include <sstream>
+#include <unistd.h>
 
 namespace miniredis {
 
@@ -16,6 +20,20 @@ RespValue handle_ping(const Command& cmd, StorageEngine&, RedisServer*) {
 // ECHO message
 RespValue handle_echo(const Command& cmd, StorageEngine&, RedisServer*) {
     return RespValue::make_bulk_string(cmd.arg(0));
+}
+
+// TYPE key
+RespValue handle_type(const Command& cmd, StorageEngine& engine, RedisServer*) {
+    auto t = engine.type(cmd.arg(0));
+    return RespValue::make_simple_string(t ? redis_type_to_string(*t) : "none");
+}
+
+// SHUTDOWN: stop the server; connections are closed and the AOF is flushed
+// during the orderly shutdown that follows.
+RespValue handle_shutdown(const Command&, StorageEngine&, RedisServer* server) {
+    if (!server) return RespValue::make_error("ERR server not available");
+    server->stop();
+    return RespValue::make_ok();
 }
 
 // DBSIZE
@@ -72,11 +90,11 @@ RespValue handle_info(const Command&, StorageEngine& engine, RedisServer* server
         oss << "keyspace_hits:" << server->stats().keyspace_hits.load() << "\r\n";
         oss << "keyspace_misses:" << server->stats().keyspace_misses.load() << "\r\n";
         oss << "expired_keys:" << server->stats().expired_keys.load() << "\r\n";
-        oss << "evicted_keys:" << server->stats().evicted_keys.load() << "\r\n";
     }
+    oss << "evicted_keys:" << engine.memory_tracker().evicted_keys() << "\r\n";
 
     oss << "\r\n# Keyspace\r\n";
-    oss << "db0:keys=" << engine.total_keys() << ",expires=" << 0 << "\r\n";
+    oss << "db0:keys=" << engine.total_keys() << ",expires=" << engine.total_expires() << "\r\n";
 
     return RespValue::make_bulk_string(oss.str());
 }
@@ -84,35 +102,68 @@ RespValue handle_info(const Command&, StorageEngine& engine, RedisServer* server
 // SAVE
 RespValue handle_save(const Command&, StorageEngine& engine, RedisServer* server) {
     if (!server) return RespValue::make_error("ERR server not available");
-    bool ok = AofRewriter::rewrite_synchronous(engine, server->aof_logger(), server->config().aof_filename);
-    if (!ok) return RespValue::make_error("ERR save failed");
+    bool ok = AofRewriter::rewrite_synchronous(engine, server->aof_logger(), server->config().aof_filename,
+                                               &server->key_locks());
+    if (!ok) return RespValue::make_error("ERR save failed or a rewrite is already in progress");
     return RespValue::make_ok();
 }
 
 // BGSAVE / BGREWRITEAOF
 RespValue handle_bgrewriteaof(const Command&, StorageEngine& engine, RedisServer* server) {
     if (!server) return RespValue::make_error("ERR server not available");
-    bool ok = AofRewriter::start_background_rewrite(engine, server->aof_logger(), server->config().aof_filename);
+    bool ok = AofRewriter::start_background_rewrite(engine, server->aof_logger(), server->config().aof_filename,
+                                                    &server->key_locks());
     if (!ok) return RespValue::make_error("ERR background rewrite already in progress or failed");
     return RespValue::make_simple_string("Background append only file rewriting started");
 }
 
-// CONFIG GET / CONFIG SET
+// CONFIG GET parameter | CONFIG SET parameter value
 RespValue handle_config(const Command& cmd, StorageEngine& engine, RedisServer*) {
-    if (cmd.arg_count() >= 2 && (cmd.arg(0) == "GET" || cmd.arg(0) == "get")) {
-        std::string param = cmd.arg(1);
+    auto lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+        return s;
+    };
+    const std::string sub = lower(cmd.arg(0));
+    auto& mem = engine.memory_tracker();
+
+    if (sub == "get" && cmd.arg_count() == 2) {
+        const std::string param = lower(cmd.arg(1));
         RespArray arr;
         if (param == "maxmemory" || param == "*") {
             arr.push_back(RespValue::make_bulk_string("maxmemory"));
-            arr.push_back(RespValue::make_bulk_string(std::to_string(engine.memory_tracker().get_max_memory())));
+            arr.push_back(RespValue::make_bulk_string(std::to_string(mem.get_max_memory())));
         }
         if (param == "maxmemory-policy" || param == "*") {
             arr.push_back(RespValue::make_bulk_string("maxmemory-policy"));
-            arr.push_back(RespValue::make_bulk_string(to_string(engine.memory_tracker().get_eviction_policy())));
+            arr.push_back(RespValue::make_bulk_string(to_string(mem.get_eviction_policy())));
         }
         return RespValue::make_array(std::move(arr));
     }
-    return RespValue::make_ok();
+
+    if (sub == "set" && cmd.arg_count() == 3) {
+        // Previously CONFIG SET replied +OK and silently changed nothing.
+        const std::string param = lower(cmd.arg(1));
+        const std::string value = lower(cmd.arg(2));
+        if (param == "maxmemory") {
+            int64_t bytes = 0;
+            if (!parse_int64_strict(value, bytes) || bytes < 0) {
+                return RespValue::make_error("ERR Invalid argument '" + cmd.arg(2) + "' for CONFIG SET 'maxmemory'");
+            }
+            mem.set_max_memory(static_cast<size_t>(bytes));
+            return RespValue::make_ok();
+        }
+        if (param == "maxmemory-policy") {
+            if (value != "noeviction" && value != "allkeys-lru" && value != "volatile-lru" &&
+                value != "allkeys-random" && value != "volatile-ttl") {
+                return RespValue::make_error("ERR Invalid argument '" + cmd.arg(2) + "' for CONFIG SET 'maxmemory-policy'");
+            }
+            mem.set_eviction_policy(parse_eviction_policy(value));
+            return RespValue::make_ok();
+        }
+        return RespValue::make_error("ERR Unsupported CONFIG parameter: " + cmd.arg(1));
+    }
+
+    return RespValue::make_error("ERR Unknown CONFIG subcommand or wrong number of arguments for '" + cmd.arg(0) + "'");
 }
 
 } // namespace miniredis
